@@ -23,7 +23,7 @@ extern "C" {
 #elif SOC_TOUCH_SENSOR_VERSION == 2     // ESP32-S2 & ESP32-S3
 #define TOUCH_SAMPLE_CFG_DEFAULT()      {TOUCH_SENSOR_V2_DEFAULT_SAMPLE_CONFIG(500, TOUCH_VOLT_LIM_L_0V5, TOUCH_VOLT_LIM_H_2V2)}
 #define TOUCH_CHAN_CFG_DEFAULT()        {  \
-    .active_thresh = {2000},  \
+    .active_thresh = {1000},  \
     .charge_speed = TOUCH_CHARGE_SPEED_7,  \
     .init_charge_volt = TOUCH_INIT_CHARGE_VOLT_DEFAULT,  \
 }

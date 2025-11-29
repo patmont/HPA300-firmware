@@ -19,6 +19,7 @@
   "idf.flashType": "UART",
   "files.associations": {
     "touch_sens.h": "c",
-    "task.h": "c"
+    "task.h": "c",
+    "leds.h": "c"
   }
 }
