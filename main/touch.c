@@ -11,12 +11,12 @@
 #define INIT_SCAN_TIMES 3
 
 static const int s_channel_id[NUM_KEYS] = {
-    1,  // key 1 = channel 1 = GPIO3
+    3,  // key 1 = channel 1 = GPIO1
     2,  // key 2 = channel 2 = GPIO2
-    3,  // key 3 = channel 3 = GPIO1
-    5,  // key 4 = channel 5 = GPIO5
-    6,  // key 5 = channel 6 = GPIO6
-    4   // key 6 = channel 4 = GPIO4
+    1,  // key 3 = channel 3 = GPIO3
+    6,  // key 4 = channel 4 = GPIO4
+    4,  // key 5 = channel 5 = GPIO5
+    5   // key 6 = channel 6 = GPIO6
 };
 
 // Active threshold to benchmark ratio. (i.e., touch will be activated when data >= benchmark * (1 + ratio))

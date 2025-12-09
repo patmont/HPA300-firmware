@@ -20,6 +20,8 @@
   "files.associations": {
     "touch_sens.h": "c",
     "task.h": "c",
-    "leds.h": "c"
-  }
+    "leds.h": "c",
+    "fan_select.h": "c"
+  },
+  "idf.monitorPort": "COM8"
 }

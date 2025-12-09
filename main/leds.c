@@ -1,4 +1,5 @@
 
+#include "board.h"
 #include "leds.h"
 #include "driver/ledc.h"
 #include "hal/gpio_hal.h"
@@ -12,8 +13,15 @@
 
 // Global array to store the GPIO numbers
 const gpio_num_t led_gpios[NUM_LEDS] = {
-    GPIO_NUM_7, GPIO_NUM_8, GPIO_NUM_9, GPIO_NUM_10,
-    GPIO_NUM_11, GPIO_NUM_12, GPIO_NUM_13, GPIO_NUM_14, GPIO_NUM_15
+    LED1_GPIO,
+    LED2_GPIO,
+    LED3_GPIO,
+    LED4_GPIO,
+    LED5_GPIO,
+    LED6_GPIO,
+    LED7_GPIO,
+    LED8_GPIO,
+    LED9_GPIO
 };
 
 // Global to store the internal signal ID for LEDC Channel 0 (used by the matrix)
