@@ -1,5 +1,6 @@
 #include "leds.h"
 #include "touch.h"
+#include "board.h"
 #include "fan_select.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -8,22 +9,13 @@
 #define TAG "MAIN_APP"
 
 typedef enum {
-    FAN_SPEED_OFF = 0,
-    FAN_SPEED_1 = 1,
-    FAN_SPEED_2 = 2,
-    FAN_SPEED_3 = 3,
-    FAN_SPEED_4 = 4,
+    FAN_SPEED_OFF,
+    FAN_SPEED_1,
+    FAN_SPEED_2,
+    FAN_SPEED_3,
+    FAN_SPEED_4,
     NUM_FAN_SPEEDS
 } fan_speed_t;
-
-// Map fan speeds to LED indices
-static const led_index_t fan_led_map[5] = { 
-    LED_OFF,
-    LED_7,  // Speed 1
-    LED_4,  // Speed 2
-    LED_1,  // Speed 3
-    LED_8   // Speed 4
-};
 
 static void update_fan_leds(fan_speed_t speed)
 {

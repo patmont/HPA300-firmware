@@ -11,19 +11,6 @@
 #define PWM_RESOLUTION      LEDC_TIMER_8_BIT  // PWM resolution
 #define PWM_FREQUENCY       5000              // Frequency in Hertz.  
 
-// Global array to store the GPIO numbers
-const gpio_num_t led_gpios[NUM_LEDS] = {
-    LED1_GPIO,
-    LED2_GPIO,
-    LED3_GPIO,
-    LED4_GPIO,
-    LED5_GPIO,
-    LED6_GPIO,
-    LED7_GPIO,
-    LED8_GPIO,
-    LED9_GPIO
-};
-
 // Global to store the internal signal ID for LEDC Channel 0 (used by the matrix)
 static int ledc_signal_id;
 

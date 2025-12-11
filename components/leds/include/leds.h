@@ -5,10 +5,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define NUM_LEDS    9
-#define START_GPIO  7
-#define END_GPIO    15
-
 // Initialize the LEDC peripheral and all 9 GPIO pins
 void ledc_init();
 

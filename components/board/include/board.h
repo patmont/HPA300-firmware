@@ -11,29 +11,55 @@
 #define TOUCH_KEY6  TOUCH_PAD_NUM4
 
 // LED GPIOs (simple GPIO numbers)
-#define LED1_GPIO  GPIO_NUM_12
-#define LED2_GPIO  GPIO_NUM_15
-#define LED3_GPIO  GPIO_NUM_8
-#define LED4_GPIO  GPIO_NUM_13
-#define LED5_GPIO  GPIO_NUM_7
-#define LED6_GPIO  GPIO_NUM_9
-#define LED7_GPIO  GPIO_NUM_14
-#define LED8_GPIO  GPIO_NUM_11
-#define LED9_GPIO  GPIO_NUM_10
+#define BOARD_LED_GPIOS(IDENT) \
+    IDENT(LED_1,  GPIO_NUM_12) \
+    IDENT(LED_2,  GPIO_NUM_15) \
+    IDENT(LED_3,  GPIO_NUM_8)  \
+    IDENT(LED_4,  GPIO_NUM_13) \
+    IDENT(LED_5,  GPIO_NUM_7)  \
+    IDENT(LED_6,  GPIO_NUM_9)  \
+    IDENT(LED_7,  GPIO_NUM_14) \
+    IDENT(LED_8,  GPIO_NUM_11) \
+    IDENT(LED_9,  GPIO_NUM_10)
 
+// LED Indicators
+#define BOARD_FAN_LED(IDENT) \
+    IDENT(FAN_LED_1,  LED_7) \
+    IDENT(FAN_LED_2,  LED_4) \
+    IDENT(FAN_LED_3,  LED_1) \
+    IDENT(FAN_LED_4,  LED_8)
+
+// Generate enum entries for each LED
+#define LED_ENUM_ENTRY(name, gpio) name,
 typedef enum {
     LED_OFF = -1,
-    LED_1 = 0,
-    LED_2,
-    LED_3,
-    LED_4,
-    LED_5,
-    LED_6,
-    LED_7,
-    LED_8,
-    LED_9,
-    LED_COUNT
+    BOARD_LED_GPIOS(LED_ENUM_ENTRY)
+    NUM_LEDS
 } led_index_t;
+#undef LED_ENUM_ENTRY
+
+// Generate led_gpios array
+#define LED_GPIO_ENTRY(name, gpio) gpio,
+static const gpio_num_t led_gpios[NUM_LEDS] = {
+    BOARD_LED_GPIOS(LED_GPIO_ENTRY)
+};
+#undef LED_GPIO_ENTRY
+
+// Generate enum entries for LED fan indicators
+#define FAN_LED_ENUM_ENTRY(name, led_index) name,
+typedef enum {
+    BOARD_FAN_LED(FAN_LED_ENUM_ENTRY)
+    FAN_LED_COUNT
+} fan_led_map_index_t;
+#undef FAN_LED_ENUM_ENTRY
+
+// Generated fan_led_map array
+#define FAN_LED_MAP_ENTRY(name, led_index) led_index,
+static const led_index_t fan_led_map[5] = {
+    LED_OFF,
+    BOARD_FAN_LED(FAN_LED_MAP_ENTRY)
+};
+#undef FAN_LED_MAP_ENTRY
 
 // HC238 Fan Selector GPIOs
 // If a select line is hardwired, set to 0 or 1.
