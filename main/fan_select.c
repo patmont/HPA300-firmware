@@ -1,7 +1,19 @@
 #include "fan_select.h"
+#include "board.h"
+#include "hc238.h"
 #include "esp_log.h"
 
 static const char *TAG = "fan_select";
+
+_Static_assert(BOARD_FAN_SPEED_COUNT == NUM_FAN_SPEEDS, "fan LED and speed maps must have equal size");
+_Static_assert(FAN_1 <= 7 && FAN_2 <= 7 && FAN_3 <= 7 && FAN_4 <= 7,
+               "HC238 output index must be 0-7");
+_Static_assert(FAN_1 != FAN_2 && FAN_1 != FAN_3 && FAN_1 != FAN_4 &&
+               FAN_2 != FAN_3 && FAN_2 != FAN_4 && FAN_3 != FAN_4,
+               "fan speeds must use distinct HC238 outputs");
+_Static_assert((FAN_1 & 1) == HC238_A0_FIXED && (FAN_2 & 1) == HC238_A0_FIXED &&
+               (FAN_3 & 1) == HC238_A0_FIXED && (FAN_4 & 1) == HC238_A0_FIXED,
+               "fan output mapping conflicts with hard-wired A0");
 
 esp_err_t fan_init(void)
 {
@@ -20,45 +32,50 @@ esp_err_t fan_init(void)
         .E3_FIXED = HC238_E3_FIXED
     };
 
-    ESP_ERROR_CHECK(hc238_init(&cfg));
+    esp_err_t err = hc238_init(&cfg);
+    if (err != ESP_OK) {
+        return err;
+    }
     ESP_LOGI(TAG, "HC238 initialized");
     return ESP_OK;
 }
 
 esp_err_t fan_enable(bool en)
 {
-    ESP_ERROR_CHECK(hc238_enable(en));
-    return ESP_OK;
+    return hc238_enable(en);
 }
 
-esp_err_t fan_select(uint8_t fan_num)
+esp_err_t fan_select(fan_speed_t speed)
 {
-    // Accept logical fan indices: 0 = OFF, 1..4 = fans
-    if (fan_num > 4) {
-        ESP_LOGW(TAG, "Invalid fan number %d; must be 0-4", fan_num);
+    if (speed < FAN_SPEED_OFF || speed >= NUM_FAN_SPEEDS) {
+        ESP_LOGW(TAG, "Invalid fan speed %d", (int)speed);
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (fan_num == 0) {
-        ESP_LOGI(TAG, "Selecting FAN_OFF — disabling fan output");
-        // Turn off the HC238 driver (disable outputs)
-        ESP_ERROR_CHECK(hc238_enable(false));
-        return ESP_OK;
+    if (speed == FAN_SPEED_OFF) {
+        ESP_LOGI(TAG, "Selecting FAN_OFF - disabling fan output");
+        return hc238_enable(false);
     }
 
-    uint8_t out_idx = 0;
-    switch (fan_num) {
-        case 1: out_idx = FAN_1; break;
-        case 2: out_idx = FAN_2; break;
-        case 3: out_idx = FAN_3; break;
-        case 4: out_idx = FAN_4; break;
-        default:
-            ESP_LOGW(TAG, "Unhandled fan number %d", fan_num);
-            return ESP_ERR_INVALID_ARG;
+    static const uint8_t output_map[NUM_FAN_SPEEDS] = {
+        [FAN_SPEED_OFF] = 0,
+        [FAN_SPEED_1] = FAN_1,
+        [FAN_SPEED_2] = FAN_2,
+        [FAN_SPEED_3] = FAN_3,
+        [FAN_SPEED_4] = FAN_4,
+    };
+    uint8_t out_idx = output_map[speed];
+
+    ESP_LOGI(TAG, "Selecting fan %d -> HC238 output %d", (int)speed, out_idx);
+    esp_err_t err = hc238_set_output(out_idx);
+    if (err != ESP_OK) {
+        return err;
     }
 
-    ESP_LOGI(TAG, "Selecting fan %d -> HC238 output %d", fan_num, out_idx);
-    ESP_ERROR_CHECK(hc238_set_output(out_idx));
-    ESP_ERROR_CHECK(hc238_enable(true));
-    return ESP_OK;
+    err = hc238_enable(true);
+    if (err != ESP_OK) {
+        // Best effort: a failed transition must leave the decoder disabled.
+        hc238_enable(false);
+    }
+    return err;
 }

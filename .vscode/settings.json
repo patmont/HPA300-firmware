@@ -23,5 +23,6 @@
     "leds.h": "c",
     "fan_select.h": "c"
   },
-  "idf.monitorPort": "COM8"
+  "idf.monitorPort": "COM8",
+  "idf.currentSetup": "C:\\Users\\Patrick\\esp\\v5.5.1\\esp-idf"
 }

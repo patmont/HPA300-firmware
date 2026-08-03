@@ -1,0 +1,2 @@
+# Keep command-line and devcontainer builds on the controller's supported MCU.
+CONFIG_IDF_TARGET="esp32s2"
