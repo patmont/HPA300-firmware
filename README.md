@@ -55,9 +55,11 @@ Current controls:
 | 1 | Cycles `off → fan 1 → fan 2 → fan 3 → off`. From fan 4, selects off. |
 | 2 | Toggles fan 4 and off. From any other active speed, selects fan 4. |
 | 3 | Directly cycles unified LED brightness: High (100%), Medium (50%), Low (5%), Off (0%). |
-| 1, 2, 4, 5, or 6 | If the intended brightness is below High, temporarily sets LEDs to High for five seconds after the last non-dimmer touch, then restores the intended brightness. |
+| 6 | While a fan is active, cycles the automatic shutoff: 2 h (LED9), 4 h (LED6), 8 h (LED3), then Always-on (no timer LED). Selecting a timed mode starts its countdown. The current test build uses 2, 4, and 8 seconds respectively. |
+| 1, 2, 4, or 5 | If the intended brightness is below High, temporarily sets LEDs to High for five seconds after the last non-dimmer touch, then restores the intended brightness. |
 
 Crossing the fan Off position in either direction resets the intended LED brightness to High. For example, after an extended idle period at Off, key 1 selects fan 1 and leaves the LEDs at High.
+Reaching Off also cancels any active fan shutoff timer. Changing between active fan speeds preserves the running timer.
 
 Current HC238 mapping:
 
