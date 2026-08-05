@@ -1,0 +1,584 @@
+#include "network.h"
+
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "cJSON.h"
+#include "controller.h"
+#include "dns_server.h"
+#include "esp_app_desc.h"
+#include "esp_check.h"
+#include "esp_event.h"
+#include "esp_http_server.h"
+#include "esp_log.h"
+#include "esp_mac.h"
+#include "esp_netif.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "nvs.h"
+#include "nvs_flash.h"
+
+#define TAG "NETWORK"
+#define SETTINGS_NAMESPACE "hpa300"
+#define API_TOKEN_KEY "api_token"
+#define API_TOKEN_MIN_LENGTH 16
+#define API_TOKEN_MAX_LENGTH 64
+#define WIFI_RETRY_LIMIT 5
+#define REQUEST_BODY_MAX 512
+
+extern const char provision_html_start[] asm("_binary_provision_html_start");
+extern const char provision_html_end[] asm("_binary_provision_html_end");
+
+static httpd_handle_t s_http_server;
+static dns_server_handle_t s_dns_server;
+static esp_netif_t *s_ap_netif;
+static bool s_wifi_started;
+static bool s_http_ready;
+static bool s_has_wifi_credentials;
+static bool s_connected;
+static bool s_provisioning;
+static bool s_provisioning_forced;
+static bool s_reconnect_pending;
+static unsigned s_retry_count;
+static char s_api_token[API_TOKEN_MAX_LENGTH + 1];
+static char s_captive_portal_uri[32];
+
+static esp_err_t provisioning_enable(bool forced);
+
+static void update_network_led(void)
+{
+    controller_network_status_t status;
+    if (s_provisioning) {
+        status = CONTROLLER_NETWORK_PROVISIONING;
+    } else if (s_connected && s_http_ready) {
+        status = CONTROLLER_NETWORK_CONNECTED;
+    } else {
+        status = CONTROLLER_NETWORK_CONNECTING;
+    }
+
+    esp_err_t err = controller_set_network_status(status);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "failed to update network status LED: %s", esp_err_to_name(err));
+    }
+}
+
+static esp_err_t init_nvs(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS requires reinitialization");
+        ESP_RETURN_ON_ERROR(nvs_flash_erase(), TAG, "failed to erase unusable NVS");
+        err = nvs_flash_init();
+    }
+    return err;
+}
+
+static esp_err_t load_api_token(void)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(SETTINGS_NAMESPACE, NVS_READONLY, &nvs);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        s_api_token[0] = '\0';
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(err, TAG, "failed to open settings");
+
+    size_t length = sizeof(s_api_token);
+    err = nvs_get_str(nvs, API_TOKEN_KEY, s_api_token, &length);
+    nvs_close(nvs);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        s_api_token[0] = '\0';
+        return ESP_OK;
+    }
+    return err;
+}
+
+static esp_err_t save_api_token(const char *token)
+{
+    nvs_handle_t nvs;
+    ESP_RETURN_ON_ERROR(nvs_open(SETTINGS_NAMESPACE, NVS_READWRITE, &nvs), TAG,
+                        "failed to open settings for writing");
+    esp_err_t err = nvs_set_str(nvs, API_TOKEN_KEY, token);
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    if (err == ESP_OK) {
+        strlcpy(s_api_token, token, sizeof(s_api_token));
+    }
+    return err;
+}
+
+static void make_setup_ssid(char *ssid, size_t size)
+{
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(ssid, size, "HPA300-%02X%02X%02X", mac[3], mac[4], mac[5]);
+}
+
+static esp_err_t configure_ap(void)
+{
+    wifi_config_t config = { 0 };
+    char ssid[sizeof(config.ap.ssid)];
+    make_setup_ssid(ssid, sizeof(ssid));
+    strlcpy((char *)config.ap.ssid, ssid, sizeof(config.ap.ssid));
+    config.ap.ssid_len = strlen(ssid);
+    config.ap.channel = 1;
+    config.ap.max_connection = 4;
+    config.ap.authmode = WIFI_AUTH_OPEN;
+    config.ap.pmf_cfg.required = false;
+    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &config), TAG,
+                        "failed to configure setup access point");
+    ESP_LOGW(TAG, "Provisioning access point enabled: %s", ssid);
+    return ESP_OK;
+}
+
+static void configure_captive_portal_dhcp(void)
+{
+    if (s_ap_netif == NULL) {
+        return;
+    }
+    esp_netif_ip_info_t ip_info;
+    if (esp_netif_get_ip_info(s_ap_netif, &ip_info) != ESP_OK) {
+        return;
+    }
+    snprintf(s_captive_portal_uri, sizeof(s_captive_portal_uri),
+             "http://" IPSTR, IP2STR(&ip_info.ip));
+    esp_netif_dhcps_stop(s_ap_netif);
+    esp_err_t err = esp_netif_dhcps_option(s_ap_netif, ESP_NETIF_OP_SET,
+                                           ESP_NETIF_CAPTIVEPORTAL_URI,
+                                           s_captive_portal_uri,
+                                           strlen(s_captive_portal_uri));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "DHCP captive-portal hint unavailable: %s", esp_err_to_name(err));
+    }
+    esp_netif_dhcps_start(s_ap_netif);
+}
+
+static esp_err_t provisioning_enable(bool forced)
+{
+    if (s_provisioning) {
+        s_provisioning_forced = s_provisioning_forced || forced;
+        update_network_led();
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_APSTA), TAG,
+                        "failed to enable AP+STA mode");
+    ESP_RETURN_ON_ERROR(configure_ap(), TAG, "failed to configure provisioning AP");
+    s_provisioning = true;
+    s_provisioning_forced = forced;
+    if (s_wifi_started) {
+        configure_captive_portal_dhcp();
+        s_dns_server = dns_server_start("WIFI_AP_DEF");
+        ESP_RETURN_ON_FALSE(s_dns_server != NULL, ESP_ERR_NO_MEM, TAG,
+                            "failed to start captive DNS");
+    }
+    update_network_led();
+    return ESP_OK;
+}
+
+static void provisioning_disable(void)
+{
+    if (!s_provisioning || s_api_token[0] == '\0' || s_provisioning_forced) {
+        return;
+    }
+    s_provisioning = false;
+    if (s_dns_server != NULL) {
+        dns_server_stop(s_dns_server);
+        s_dns_server = NULL;
+    }
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "failed to disable setup AP: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "Provisioning access point disabled");
+    }
+    update_network_led();
+}
+
+static void reconnect_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(30000));
+    s_reconnect_pending = false;
+    if (!s_connected && s_has_wifi_credentials) {
+        esp_wifi_connect();
+    }
+    vTaskDelete(NULL);
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t event_id,
+                               void *event_data)
+{
+    (void)arg;
+    (void)event_data;
+    if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        update_network_led();
+        if (s_has_wifi_credentials) {
+            esp_wifi_connect();
+        }
+    } else if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        s_connected = false;
+        update_network_led();
+        if (!s_has_wifi_credentials) {
+            return;
+        }
+        if (s_retry_count < WIFI_RETRY_LIMIT) {
+            s_retry_count++;
+            esp_wifi_connect();
+            ESP_LOGW(TAG, "Wi-Fi reconnect attempt %u/%u", s_retry_count, WIFI_RETRY_LIMIT);
+        } else if (!s_reconnect_pending) {
+            s_retry_count = 0;
+            s_reconnect_pending = true;
+            ESP_LOGW(TAG, "Wi-Fi unavailable; retrying in 30 seconds (setup requires the physical gesture)");
+            if (xTaskCreate(reconnect_task, "wifi_reconnect", 2048, NULL, 4, NULL) != pdPASS) {
+                s_reconnect_pending = false;
+                ESP_LOGE(TAG, "failed to schedule Wi-Fi reconnect");
+            }
+        }
+    } else if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        const ip_event_got_ip_t *event = event_data;
+        s_connected = true;
+        s_retry_count = 0;
+        ESP_LOGI(TAG, "Wi-Fi connected, address " IPSTR, IP2STR(&event->ip_info.ip));
+        provisioning_disable();
+        update_network_led();
+    }
+}
+
+static esp_err_t send_json(httpd_req_t *request, cJSON *json)
+{
+    char *text = cJSON_PrintUnformatted(json);
+    if (text == NULL) {
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "JSON allocation failed");
+    }
+    httpd_resp_set_type(request, "application/json");
+    esp_err_t err = httpd_resp_sendstr(request, text);
+    cJSON_free(text);
+    return err;
+}
+
+static esp_err_t send_json_error(httpd_req_t *request, const char *status,
+                                 const char *message)
+{
+    cJSON *json = cJSON_CreateObject();
+    if (json == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddStringToObject(json, "error", message);
+    httpd_resp_set_status(request, status);
+    esp_err_t err = send_json(request, json);
+    cJSON_Delete(json);
+    return err;
+}
+
+static bool request_is_authorized(httpd_req_t *request)
+{
+    if (s_api_token[0] == '\0') {
+        return false;
+    }
+    size_t value_length = httpd_req_get_hdr_value_len(request, "Authorization");
+    if (value_length == 0 || value_length >= API_TOKEN_MAX_LENGTH + 8) {
+        return false;
+    }
+    char value[API_TOKEN_MAX_LENGTH + 8];
+    if (httpd_req_get_hdr_value_str(request, "Authorization", value, sizeof(value)) != ESP_OK) {
+        return false;
+    }
+    return strncmp(value, "Bearer ", 7) == 0 && strcmp(value + 7, s_api_token) == 0;
+}
+
+static esp_err_t require_authorization(httpd_req_t *request)
+{
+    if (request_is_authorized(request)) {
+        return ESP_OK;
+    }
+    httpd_resp_set_hdr(request, "WWW-Authenticate", "Bearer");
+    return send_json_error(request, "401 Unauthorized", "missing or invalid bearer token");
+}
+
+static esp_err_t receive_body(httpd_req_t *request, char *body, size_t capacity)
+{
+    if (request->content_len <= 0 || (size_t)request->content_len >= capacity) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    size_t received_total = 0;
+    while (received_total < (size_t)request->content_len) {
+        int received = httpd_req_recv(request, body + received_total,
+                                      request->content_len - received_total);
+        if (received <= 0) {
+            return ESP_FAIL;
+        }
+        received_total += (size_t)received;
+    }
+    body[received_total] = '\0';
+    return ESP_OK;
+}
+
+static cJSON *make_state_json(void)
+{
+    controller_snapshot_t state;
+    if (controller_get_snapshot(&state) != ESP_OK) {
+        return NULL;
+    }
+    cJSON *json = cJSON_CreateObject();
+    if (json == NULL) {
+        return NULL;
+    }
+    cJSON_AddBoolToObject(json, "power", state.fan_speed != FAN_SPEED_OFF);
+    cJSON_AddNumberToObject(json, "speed", state.fan_speed);
+    cJSON_AddNumberToObject(json, "percentage", state.fan_speed * 25);
+    cJSON_AddStringToObject(json, "source", controller_source_name(state.last_change_source));
+    cJSON_AddStringToObject(json, "timer", controller_shutoff_mode_name(state.shutoff_mode));
+    cJSON_AddNumberToObject(json, "led_brightness", state.led_brightness_percent);
+    cJSON_AddBoolToObject(json, "wifi_connected", s_connected);
+    return json;
+}
+
+static esp_err_t root_get_handler(httpd_req_t *request)
+{
+    if (s_provisioning) {
+        httpd_resp_set_type(request, "text/html");
+        return httpd_resp_send(request, provision_html_start,
+                               provision_html_end - provision_html_start);
+    }
+    httpd_resp_set_type(request, "text/plain");
+    return httpd_resp_sendstr(request,
+                              "HPA300 local API\nGET /api/v1/device\nGET /api/v1/state\nPUT /api/v1/fan\n");
+}
+
+static esp_err_t device_get_handler(httpd_req_t *request)
+{
+    if (!request_is_authorized(request)) {
+        return require_authorization(request);
+    }
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    char id[18];
+    snprintf(id, sizeof(id), "%02x%02x%02x%02x%02x%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    const esp_app_desc_t *app = esp_app_get_description();
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "id", id);
+    cJSON_AddStringToObject(json, "name", "HPA300");
+    cJSON_AddStringToObject(json, "model", "Honeywell HPA300 custom controller");
+    cJSON_AddStringToObject(json, "api_version", "1");
+    cJSON_AddStringToObject(json, "firmware_version", app->version);
+    cJSON_AddNumberToObject(json, "speed_count", 4);
+    esp_err_t err = send_json(request, json);
+    cJSON_Delete(json);
+    return err;
+}
+
+static esp_err_t state_get_handler(httpd_req_t *request)
+{
+    if (!request_is_authorized(request)) {
+        return require_authorization(request);
+    }
+    cJSON *json = make_state_json();
+    if (json == NULL) {
+        return send_json_error(request, "500 Internal Server Error", "failed to read controller state");
+    }
+    esp_err_t err = send_json(request, json);
+    cJSON_Delete(json);
+    return err;
+}
+
+static esp_err_t fan_put_handler(httpd_req_t *request)
+{
+    if (!request_is_authorized(request)) {
+        return require_authorization(request);
+    }
+    char body[128];
+    if (receive_body(request, body, sizeof(body)) != ESP_OK) {
+        return send_json_error(request, "400 Bad Request", "invalid request body");
+    }
+    cJSON *json = cJSON_Parse(body);
+    cJSON *speed_json = json == NULL ? NULL : cJSON_GetObjectItemCaseSensitive(json, "speed");
+    if (!cJSON_IsNumber(speed_json) || speed_json->valuedouble != speed_json->valueint ||
+        speed_json->valueint < FAN_SPEED_OFF || speed_json->valueint >= NUM_FAN_SPEEDS) {
+        cJSON_Delete(json);
+        return send_json_error(request, "422 Unprocessable Entity", "speed must be an integer from 0 through 4");
+    }
+    fan_speed_t speed = (fan_speed_t)speed_json->valueint;
+    cJSON_Delete(json);
+    if (controller_set_remote_fan_speed(speed) != ESP_OK) {
+        return send_json_error(request, "500 Internal Server Error", "fan transition failed");
+    }
+    cJSON *state = make_state_json();
+    if (state == NULL) {
+        return send_json_error(request, "500 Internal Server Error", "failed to read updated state");
+    }
+    esp_err_t err = send_json(request, state);
+    cJSON_Delete(state);
+    return err;
+}
+
+static void restart_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    esp_restart();
+}
+
+static esp_err_t provision_post_handler(httpd_req_t *request)
+{
+    if (!s_provisioning) {
+        return send_json_error(request, "403 Forbidden", "provisioning is not active");
+    }
+    char body[REQUEST_BODY_MAX];
+    if (receive_body(request, body, sizeof(body)) != ESP_OK) {
+        return send_json_error(request, "400 Bad Request", "invalid request body");
+    }
+    cJSON *json = cJSON_Parse(body);
+    cJSON *ssid_json = json == NULL ? NULL : cJSON_GetObjectItemCaseSensitive(json, "ssid");
+    cJSON *password_json = json == NULL ? NULL : cJSON_GetObjectItemCaseSensitive(json, "password");
+    cJSON *token_json = json == NULL ? NULL : cJSON_GetObjectItemCaseSensitive(json, "api_token");
+    if (!cJSON_IsString(ssid_json) || !cJSON_IsString(password_json) || !cJSON_IsString(token_json)) {
+        cJSON_Delete(json);
+        return send_json_error(request, "422 Unprocessable Entity", "ssid, password, and api_token are required strings");
+    }
+
+    size_t ssid_length = strlen(ssid_json->valuestring);
+    size_t password_length = strlen(password_json->valuestring);
+    size_t token_length = strlen(token_json->valuestring);
+    if (ssid_length == 0 || ssid_length > 32 || password_length > 63 ||
+        (password_length > 0 && password_length < 8) ||
+        token_length < API_TOKEN_MIN_LENGTH || token_length > API_TOKEN_MAX_LENGTH) {
+        cJSON_Delete(json);
+        return send_json_error(request, "422 Unprocessable Entity",
+                               "invalid SSID, Wi-Fi password, or API token length");
+    }
+
+    wifi_config_t config = { 0 };
+    // An IEEE 802.11 SSID may occupy all 32 bytes and therefore need not be
+    // NUL-terminated in wifi_config_t.
+    memcpy(config.sta.ssid, ssid_json->valuestring, ssid_length);
+    strlcpy((char *)config.sta.password, password_json->valuestring, sizeof(config.sta.password));
+    config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    config.sta.threshold.authmode = password_length == 0 ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
+    config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+
+    esp_err_t err = save_api_token(token_json->valuestring);
+    if (err == ESP_OK) {
+        err = esp_wifi_set_storage(WIFI_STORAGE_FLASH);
+    }
+    if (err == ESP_OK) {
+        err = esp_wifi_set_config(WIFI_IF_STA, &config);
+    }
+    cJSON_Delete(json);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "failed to store provisioning data: %s", esp_err_to_name(err));
+        return send_json_error(request, "500 Internal Server Error", "failed to save configuration");
+    }
+
+    s_has_wifi_credentials = true;
+    cJSON *response = cJSON_CreateObject();
+    cJSON_AddBoolToObject(response, "saved", true);
+    cJSON_AddBoolToObject(response, "restarting", true);
+    err = send_json(request, response);
+    cJSON_Delete(response);
+    if (err == ESP_OK && xTaskCreate(restart_task, "restart", 2048, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "configuration saved but restart task could not be created");
+    }
+    return err;
+}
+
+static esp_err_t not_found_handler(httpd_req_t *request, httpd_err_code_t error)
+{
+    (void)error;
+    if (s_provisioning && request->method == HTTP_GET) {
+        httpd_resp_set_status(request, "302 Temporary Redirect");
+        httpd_resp_set_hdr(request, "Location", "/");
+        return httpd_resp_sendstr(request, "Redirecting to HPA300 setup");
+    }
+    return httpd_resp_send_err(request, HTTPD_404_NOT_FOUND, "Not found");
+}
+
+static esp_err_t start_http_server(void)
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.lru_purge_enable = true;
+    ESP_RETURN_ON_ERROR(httpd_start(&s_http_server, &config), TAG, "failed to start HTTP server");
+
+    const httpd_uri_t handlers[] = {
+        { .uri = "/", .method = HTTP_GET, .handler = root_get_handler },
+        { .uri = "/api/v1/device", .method = HTTP_GET, .handler = device_get_handler },
+        { .uri = "/api/v1/state", .method = HTTP_GET, .handler = state_get_handler },
+        { .uri = "/api/v1/fan", .method = HTTP_PUT, .handler = fan_put_handler },
+        { .uri = "/api/v1/provision", .method = HTTP_POST, .handler = provision_post_handler },
+    };
+    for (size_t i = 0; i < sizeof(handlers) / sizeof(handlers[0]); i++) {
+        ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_http_server, &handlers[i]), TAG,
+                            "failed to register HTTP handler");
+    }
+    ESP_RETURN_ON_ERROR(httpd_register_err_handler(s_http_server, HTTPD_404_NOT_FOUND,
+                                                    not_found_handler), TAG,
+                        "failed to register captive redirect");
+    s_http_ready = true;
+    update_network_led();
+    ESP_LOGI(TAG, "HTTP API started on port 80");
+    return ESP_OK;
+}
+
+esp_err_t network_init(void)
+{
+    update_network_led();
+    ESP_RETURN_ON_ERROR(init_nvs(), TAG, "failed to initialize NVS");
+    ESP_RETURN_ON_ERROR(load_api_token(), TAG, "failed to load API token");
+    ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "failed to initialize TCP/IP stack");
+    ESP_RETURN_ON_ERROR(esp_event_loop_create_default(), TAG, "failed to create event loop");
+
+    esp_netif_create_default_wifi_sta();
+    s_ap_netif = esp_netif_create_default_wifi_ap();
+    ESP_RETURN_ON_FALSE(s_ap_netif != NULL, ESP_ERR_NO_MEM, TAG, "failed to create AP interface");
+
+    wifi_init_config_t init_config = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_RETURN_ON_ERROR(esp_wifi_init(&init_config), TAG, "failed to initialize Wi-Fi");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_FLASH), TAG, "failed to enable Wi-Fi persistence");
+
+    wifi_config_t stored_config = { 0 };
+    esp_err_t err = esp_wifi_get_config(WIFI_IF_STA, &stored_config);
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_INIT) {
+        ESP_RETURN_ON_ERROR(err, TAG, "failed to read stored Wi-Fi configuration");
+    }
+    s_has_wifi_credentials = stored_config.sta.ssid[0] != '\0';
+
+    ESP_RETURN_ON_ERROR(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                   wifi_event_handler, NULL), TAG,
+                        "failed to register Wi-Fi events");
+    ESP_RETURN_ON_ERROR(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                   wifi_event_handler, NULL), TAG,
+                        "failed to register IP events");
+
+    bool needs_provisioning = !s_has_wifi_credentials || s_api_token[0] == '\0';
+    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(needs_provisioning ? WIFI_MODE_APSTA : WIFI_MODE_STA),
+                        TAG, "failed to set Wi-Fi mode");
+    if (needs_provisioning) {
+        ESP_RETURN_ON_ERROR(configure_ap(), TAG, "failed to configure setup AP");
+        s_provisioning = true;
+        s_provisioning_forced = false;
+    }
+
+    ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "failed to start Wi-Fi");
+    s_wifi_started = true;
+    if (s_provisioning) {
+        configure_captive_portal_dhcp();
+        s_dns_server = dns_server_start("WIFI_AP_DEF");
+        ESP_RETURN_ON_FALSE(s_dns_server != NULL, ESP_ERR_NO_MEM, TAG,
+                            "failed to start captive DNS");
+        update_network_led();
+    }
+    return start_http_server();
+}
+
+esp_err_t network_start_provisioning(void)
+{
+    ESP_RETURN_ON_FALSE(s_wifi_started, ESP_ERR_INVALID_STATE, TAG, "network is not initialized");
+    ESP_LOGW(TAG, "physical setup gesture accepted");
+    return provisioning_enable(true);
+}

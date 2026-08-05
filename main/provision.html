@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>HPA300 setup</title>
+  <style>
+    body{font:16px system-ui,sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem;color:#17202a}
+    label{display:block;margin:1rem 0 .3rem}input{box-sizing:border-box;width:100%;padding:.7rem}
+    button{margin-top:1.4rem;padding:.8rem 1.2rem}#status{margin-top:1rem;white-space:pre-wrap}
+  </style>
+</head>
+<body>
+  <h1>HPA300 setup</h1>
+  <p>Enter the Wi-Fi network and a private API token for Home Assistant. The token must be 16-64 characters.</p>
+  <form id="setup">
+    <label for="ssid">Wi-Fi network</label>
+    <input id="ssid" maxlength="32" autocomplete="username" required>
+    <label for="password">Wi-Fi password</label>
+    <input id="password" type="password" maxlength="63" autocomplete="current-password">
+    <label for="token">Home Assistant API token</label>
+    <input id="token" type="password" minlength="16" maxlength="64" autocomplete="new-password" required>
+    <button type="submit">Save and connect</button>
+  </form>
+  <div id="status" role="status"></div>
+  <script>
+    const form=document.getElementById('setup'),status=document.getElementById('status'),
+      ssid=document.getElementById('ssid'),password=document.getElementById('password'),token=document.getElementById('token');
+    form.addEventListener('submit',async event=>{
+      event.preventDefault(); status.textContent='Saving...';
+      try {
+        const response=await fetch('/api/v1/provision',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid:ssid.value,password:password.value,api_token:token.value})});
+        const result=await response.json();
+        if(!response.ok) throw new Error(result.error||`HTTP ${response.status}`);
+        status.textContent='Saved. The purifier is restarting and will join your Wi-Fi network.';
+        form.hidden=true;
+      } catch(error) { status.textContent=`Setup failed: ${error.message}`; }
+    });
+  </script>
+</body>
+</html>

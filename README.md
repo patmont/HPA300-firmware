@@ -20,8 +20,59 @@ idf.py build
 The board mapping/invariant test application can be built separately:
 
 ```text
-idf.py -C test -B ../build-test build
+idf.py -C test -B build-test build
 ```
+
+## Wi-Fi setup and local API
+
+Networking is optional and starts only after fan control, LEDs, the controller,
+and touch input are operational. A network initialization failure does not stop
+local appliance control.
+
+On first boot, join the open access point named `HPA300-xxxxxx`. Most clients
+will open the setup page automatically; otherwise browse to `http://192.168.4.1/`.
+Enter the Wi-Fi SSID, Wi-Fi password, and a private 16-64 character API token.
+The controller stores the settings in NVS, restarts, joins the configured
+network, and closes the setup access point.
+
+The UART log reports provisioning AP activation, reconnect attempts, the
+station IP address, and HTTP API startup. During bring-up, the front-panel
+LED2 (the Check Filters indicator) also shows network status:
+
+| LED2 pattern | Network status |
+| --- | --- |
+| Fast blink | Provisioning portal active |
+| Slow blink | Connecting or waiting to retry |
+| Solid | Wi-Fi connected and HTTP API ready |
+| Off | Network subsystem unavailable |
+
+LED2 uses the panel's shared brightness setting, so it is intentionally dark
+when the user-selected LED brightness is Off.
+
+After enrollment, the setup portal can only be reopened by tapping keys
+`4, 5, 4, 5` within ten seconds. A Wi-Fi outage by itself never exposes the
+unauthenticated setup portal. Reserve the controller's address in the router's
+DHCP configuration because this phase intentionally does not use mDNS or
+Zeroconf.
+
+The version 1 HTTP API listens on port 80:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/v1/device` | Stable device ID, firmware/API versions, and capabilities |
+| `GET` | `/api/v1/state` | Selected fan speed, power, change source, timer, and LED state |
+| `PUT` | `/api/v1/fan` | Select fan speed with `{"speed": 0}` through `{"speed": 4}` |
+
+All operational API requests require `Authorization: Bearer <token>`. The token
+is protected from unauthenticated API clients, but HTTP does not encrypt it on
+the LAN. Use this phase on a trusted network. A REST fan package example is in
+`home-assistant/hpa300.yaml.example`; it polls actual controller state every
+five seconds and exposes a standard Home Assistant fan with four 25% steps.
+Copy it into a Home Assistant packages directory, add the documented URLs and
+authorization value to `secrets.yaml`, and reserve the purifier's DHCP address.
+
+Commands received through the REST API cancel any active local timed-off mode,
+so a manual timer cannot unexpectedly defeat Home Assistant control.
 
 ## Safety model
 
@@ -56,7 +107,7 @@ Current controls:
 | 2 | Toggles fan 4 and off. From any other active speed, selects fan 4. |
 | 3 | Directly cycles unified LED brightness: High (100%), Medium (50%), Low (5%), Off (0%). |
 | 6 | While a fan is active, cycles the automatic shutoff: 2 h (LED9), 4 h (LED6), 8 h (LED3), then Always-on (no timer LED). Selecting a timed mode starts its countdown. The current test build uses 2, 4, and 8 seconds respectively. |
-| 1, 2, 4, or 5 | If the intended brightness is below High, temporarily sets LEDs to High for five seconds after the last non-dimmer touch, then restores the intended brightness. |
+| 1, 2, 4, or 5 | If the intended brightness is below High, temporarily sets LEDs to High for three seconds after the last non-dimmer touch, then restores the intended brightness. |
 
 Crossing the fan Off position in either direction resets the intended LED brightness to High. For example, after an extended idle period at Off, key 1 selects fan 1 and leaves the LEDs at High.
 Reaching Off also cancels any active fan shutoff timer. Changing between active fan speeds preserves the running timer.
@@ -80,7 +131,7 @@ Verified LED mapping:
 | LED | GPIO | Function |
 | --- | --- | --- |
 | LED1 | 12 | Fan speed 3 |
-| LED2 | 15 | Check filters |
+| LED2 | 15 | Check filters; temporary Wi-Fi status overlay |
 | LED3 | 8 | 8-hour timer |
 | LED4 | 13 | Fan speed 2 |
 | LED5 | 7 | Check pre-filter |

@@ -1,0 +1,67 @@
+# Home Assistant package for the HPA300 local REST API.
+#
+# Add these values to secrets.yaml before including this package:
+#   hpa300_state_url: "http://192.168.1.50/api/v1/state"
+#   hpa300_fan_url: "http://192.168.1.50/api/v1/fan"
+#   hpa300_authorization: "Bearer replace-with-the-token-entered-during-setup"
+
+rest:
+  - resource: !secret hpa300_state_url
+    scan_interval: 5
+    timeout: 3
+    headers:
+      Authorization: !secret hpa300_authorization
+    sensor:
+      - name: HPA300 State
+        unique_id: hpa300_rest_state
+        value_template: "{{ value_json.speed }}"
+        json_attributes:
+          - power
+          - percentage
+          - source
+          - timer
+          - led_brightness
+          - wifi_connected
+
+rest_command:
+  hpa300_set_speed:
+    url: !secret hpa300_fan_url
+    method: put
+    timeout: 3
+    headers:
+      Authorization: !secret hpa300_authorization
+      Content-Type: application/json
+    payload: '{"speed": {{ speed | int(0) }}}'
+
+template:
+  - fan:
+      - name: HPA300
+        unique_id: hpa300_rest_fan
+        speed_count: 4
+        state: >-
+          {{ none if states('sensor.hpa300_state') in ['unknown', 'unavailable']
+             else states('sensor.hpa300_state') | int(0) > 0 }}
+        percentage: >-
+          {{ none if states('sensor.hpa300_state') in ['unknown', 'unavailable']
+             else states('sensor.hpa300_state') | int(0) * 25 }}
+        turn_on:
+          - action: rest_command.hpa300_set_speed
+            data:
+              speed: 1
+          - action: homeassistant.update_entity
+            target:
+              entity_id: sensor.hpa300_state
+        turn_off:
+          - action: rest_command.hpa300_set_speed
+            data:
+              speed: 0
+          - action: homeassistant.update_entity
+            target:
+              entity_id: sensor.hpa300_state
+        set_percentage:
+          - action: rest_command.hpa300_set_speed
+            data:
+              speed: "{{ ((percentage | int(0) + 24) // 25) | int }}"
+          - action: homeassistant.update_entity
+            target:
+              entity_id: sensor.hpa300_state
