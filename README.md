@@ -17,6 +17,11 @@ idf.py set-target esp32s2
 idf.py build
 ```
 
+The ESP32-S2 application console uses the board's native USB-C connection via
+USB CDC. For an initial flash, hold Boot, tap Reset, then release Boot to enter
+ROM download mode. After flashing, the application console may enumerate under
+a different COM port; list ports again before starting `idf.py monitor`.
+
 The board mapping/invariant test application can be built separately:
 
 ```text

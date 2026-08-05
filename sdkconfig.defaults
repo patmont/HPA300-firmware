@@ -1,2 +1,9 @@
 # Keep command-line and devcontainer builds on the controller's supported MCU.
 CONFIG_IDF_TARGET="esp32s2"
+
+# The board's USB-C connector is wired directly to the ESP32-S2 USB peripheral;
+# keep the application console on that connector rather than requiring the
+# separate TC2030 UART cable.
+CONFIG_ESP_CONSOLE_USB_CDC=y
+CONFIG_ESP_CONSOLE_USB_CDC_SUPPORT_ETS_PRINTF=y
+CONFIG_ESP32S2_KEEP_USB_ALIVE=y
