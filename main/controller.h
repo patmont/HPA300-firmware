@@ -19,6 +19,7 @@ typedef enum {
     CONTROLLER_NETWORK_CONNECTING,
     CONTROLLER_NETWORK_PROVISIONING,
     CONTROLLER_NETWORK_CONNECTED,
+    CONTROLLER_NETWORK_UPDATING,
 } controller_network_status_t;
 
 typedef struct {

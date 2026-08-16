@@ -13,6 +13,7 @@
 #define NETWORK_LED LED_2
 #define NETWORK_CONNECTING_TOGGLE_MS 500
 #define NETWORK_PROVISIONING_TOGGLE_MS 250
+#define NETWORK_UPDATING_TOGGLE_MS 100
 
 // Temporary hardware-test durations. Keep the logical mode names and LED
 // labels in hours; replace these with 2h, 4h, and 8h before production.
@@ -231,6 +232,9 @@ static esp_err_t service_network_led_locked(TickType_t now)
         case CONTROLLER_NETWORK_PROVISIONING:
             toggle_ms = NETWORK_PROVISIONING_TOGGLE_MS;
             break;
+        case CONTROLLER_NETWORK_UPDATING:
+            toggle_ms = NETWORK_UPDATING_TOGGLE_MS;
+            break;
         case CONTROLLER_NETWORK_OFFLINE:
         case CONTROLLER_NETWORK_CONNECTED:
         default:
@@ -352,7 +356,7 @@ esp_err_t controller_set_remote_fan_speed(fan_speed_t speed)
 esp_err_t controller_set_network_status(controller_network_status_t status)
 {
     ESP_RETURN_ON_FALSE(status >= CONTROLLER_NETWORK_OFFLINE &&
-                            status <= CONTROLLER_NETWORK_CONNECTED,
+                            status <= CONTROLLER_NETWORK_UPDATING,
                         ESP_ERR_INVALID_ARG, TAG, "invalid network status %d", (int)status);
     ESP_RETURN_ON_FALSE(s_lock != NULL, ESP_ERR_INVALID_STATE, TAG, "controller not initialized");
 

@@ -1,5 +1,6 @@
 # Keep command-line and devcontainer builds on the controller's supported MCU.
 CONFIG_IDF_TARGET="esp32s2"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
 # The board's USB-C connector is wired directly to the ESP32-S2 USB peripheral;
 # keep the application console on that connector rather than requiring the
@@ -7,3 +8,28 @@ CONFIG_IDF_TARGET="esp32s2"
 CONFIG_ESP_CONSOLE_USB_CDC=y
 CONFIG_ESP_CONSOLE_USB_CDC_SUPPORT_ETS_PRINTF=y
 CONFIG_ESP32S2_KEEP_USB_ALIVE=y
+
+# Capture supply sags at the highest available ESP32-S2 brownout threshold.
+# The cause is retained by reset/RTC hardware and read on the next boot; the
+# diagnostic path does not write flash while power is failing.
+CONFIG_ESP_BROWNOUT_DET=y
+CONFIG_ESP_BROWNOUT_DET_LVL_SEL_7=y
+CONFIG_SPI_FLASH_BROWNOUT_RESET=y
+
+# A 2 MB controller has two 960 KiB OTA slots. Optimize for size to preserve
+# at least 64 KiB of growth/metadata headroom in the signed release image.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+# Use two application slots so a complete image is validated before it can
+# replace the running firmware, and retain the previous image for rollback.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-4mb.csv"
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# Sign and verify OTA applications without burning Secure Boot or flash
+# encryption eFuses. The key is local-only; secrets/ is ignored by Git.
+CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT=y
+CONFIG_SECURE_SIGNED_APPS_RSA_SCHEME=y
+CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT=y
+CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES=y
+CONFIG_SECURE_BOOT_SIGNING_KEY="secrets/hpa300-ota-signing-key.pem"

@@ -2,3 +2,4 @@ build/
 build-test/
 sdkconfig
 sdkconfig.old
+secrets/

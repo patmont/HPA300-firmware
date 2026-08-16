@@ -2,10 +2,12 @@
 
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "cJSON.h"
 #include "controller.h"
+#include "diagnostics.h"
 #include "dns_server.h"
 #include "esp_app_desc.h"
 #include "esp_check.h"
@@ -14,12 +16,16 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
+#include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
+#include "esp_wifi_ap_get_sta_list.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "lwip/sockets.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "ota_update.h"
 
 #define TAG "NETWORK"
 #define SETTINGS_NAMESPACE "hpa300"
@@ -28,12 +34,18 @@
 #define API_TOKEN_MAX_LENGTH 64
 #define WIFI_RETRY_LIMIT 5
 #define REQUEST_BODY_MAX 512
+#define OTA_MAINTENANCE_WINDOW_MS (10 * 60 * 1000)
+#define OTA_RECEIVE_BUFFER_SIZE 4096
+#define OTA_PREFLIGHT_BUFFER_SIZE 512
 
 extern const char provision_html_start[] asm("_binary_provision_html_start");
 extern const char provision_html_end[] asm("_binary_provision_html_end");
+extern const char update_html_start[] asm("_binary_update_html_start");
+extern const char update_html_end[] asm("_binary_update_html_end");
 
 static httpd_handle_t s_http_server;
 static dns_server_handle_t s_dns_server;
+static esp_netif_t *s_sta_netif;
 static esp_netif_t *s_ap_netif;
 static bool s_wifi_started;
 static bool s_http_ready;
@@ -42,11 +54,18 @@ static bool s_connected;
 static bool s_provisioning;
 static bool s_provisioning_forced;
 static bool s_reconnect_pending;
+static bool s_maintenance_active;
+static bool s_maintenance_keep_ap;
+static volatile bool s_ota_request_active;
+static TickType_t s_maintenance_started;
 static unsigned s_retry_count;
 static char s_api_token[API_TOKEN_MAX_LENGTH + 1];
 static char s_captive_portal_uri[32];
+static char s_last_ota_result[96];
 
 static esp_err_t provisioning_enable(bool forced);
+static void maintenance_close(bool preserve_ap);
+static void restart_task(void *arg);
 
 static void update_network_led(void)
 {
@@ -199,6 +218,36 @@ static void provisioning_disable(void)
     update_network_led();
 }
 
+static void maintenance_close(bool preserve_ap)
+{
+    if (!s_maintenance_active) {
+        return;
+    }
+    s_maintenance_active = false;
+    s_provisioning_forced = false;
+    if (!preserve_ap && !s_maintenance_keep_ap) {
+        provisioning_disable();
+    }
+    s_maintenance_keep_ap = false;
+    ESP_LOGI(TAG, "firmware maintenance window closed");
+}
+
+void network_service(void)
+{
+    if (!s_maintenance_active || network_ota_is_busy()) {
+        return;
+    }
+    TickType_t now = xTaskGetTickCount();
+    if ((now - s_maintenance_started) >= pdMS_TO_TICKS(OTA_MAINTENANCE_WINDOW_MS)) {
+        maintenance_close(false);
+    }
+}
+
+bool network_ota_is_busy(void)
+{
+    return s_ota_request_active || ota_update_is_busy();
+}
+
 static void reconnect_task(void *arg)
 {
     (void)arg;
@@ -276,6 +325,42 @@ static esp_err_t send_json_error(httpd_req_t *request, const char *status,
     return err;
 }
 
+static void add_boot_diagnostics(cJSON *json)
+{
+    const diagnostics_boot_info_t *boot = diagnostics_get_boot_info();
+    cJSON *reset = cJSON_AddObjectToObject(json, "last_boot");
+    if (reset == NULL) {
+        return;
+    }
+    cJSON_AddStringToObject(reset, "reason", boot->reset_reason_name);
+    cJSON_AddNumberToObject(reset, "code", boot->reset_reason);
+    cJSON_AddBoolToObject(reset, "power_related", boot->power_related);
+    cJSON_AddBoolToObject(reset, "planned", boot->planned);
+    if (boot->planned) {
+        cJSON_AddStringToObject(reset, "planned_reason", boot->planned_reason);
+    }
+}
+
+static void close_upload_session(httpd_req_t *request)
+{
+    int socket = httpd_req_to_sockfd(request);
+    if (socket >= 0) {
+        // Rejected uploads can have a large unread request body. Closing the
+        // session prevents those bytes from starving the HTTP task or being
+        // parsed as another request on a persistent connection.
+        httpd_sess_trigger_close(request->handle, socket);
+    }
+}
+
+static esp_err_t send_json_error_and_close(httpd_req_t *request, const char *status,
+                                           const char *message)
+{
+    httpd_resp_set_hdr(request, "Connection", "close");
+    esp_err_t err = send_json_error(request, status, message);
+    close_upload_session(request);
+    return err;
+}
+
 static bool request_is_authorized(httpd_req_t *request)
 {
     if (s_api_token[0] == '\0') {
@@ -299,6 +384,78 @@ static esp_err_t require_authorization(httpd_req_t *request)
     }
     httpd_resp_set_hdr(request, "WWW-Authenticate", "Bearer");
     return send_json_error(request, "401 Unauthorized", "missing or invalid bearer token");
+}
+
+static bool request_is_from_ap(httpd_req_t *request)
+{
+    if (s_ap_netif == NULL) {
+        return false;
+    }
+    int socket = httpd_req_to_sockfd(request);
+    struct sockaddr_in local = { 0 };
+    socklen_t length = sizeof(local);
+    if (socket < 0) {
+        return false;
+    }
+    esp_netif_ip_info_t ap_ip;
+    if (getsockname(socket, (struct sockaddr *)&local, &length) == 0 &&
+        local.sin_family == AF_INET &&
+        esp_netif_get_ip_info(s_ap_netif, &ap_ip) == ESP_OK &&
+        local.sin_addr.s_addr == ap_ip.ip.addr) {
+        return true;
+    }
+
+    // An accepted socket from a server bound to INADDR_ANY can report
+    // 0.0.0.0 as its local address. In that case identify the interface by
+    // matching the peer against the SoftAP's actual associated/DHCP clients.
+    struct sockaddr_in peer = { 0 };
+    length = sizeof(peer);
+    if (getpeername(socket, (struct sockaddr *)&peer, &length) != 0 ||
+        peer.sin_family != AF_INET) {
+        return false;
+    }
+    wifi_sta_list_t wifi_clients = { 0 };
+    wifi_sta_mac_ip_list_t ip_clients = { 0 };
+    if (esp_wifi_ap_get_sta_list(&wifi_clients) != ESP_OK ||
+        esp_wifi_ap_get_sta_list_with_ip(&wifi_clients, &ip_clients) != ESP_OK) {
+        return false;
+    }
+    for (int i = 0; i < ip_clients.num; ++i) {
+        if (ip_clients.sta[i].ip.addr == peer.sin_addr.s_addr) {
+            return true;
+        }
+    }
+
+    // Some DHCP clients are absent briefly from the MAC/IP list even though
+    // they already have a working AP socket. Accept the SoftAP subnet only
+    // when it does not overlap the active STA subnet. If the networks overlap,
+    // fail closed and require the bearer token.
+    if (esp_netif_get_ip_info(s_ap_netif, &ap_ip) != ESP_OK ||
+        (peer.sin_addr.s_addr & ap_ip.netmask.addr) !=
+            (ap_ip.ip.addr & ap_ip.netmask.addr)) {
+        return false;
+    }
+    esp_netif_ip_info_t sta_ip = { 0 };
+    if (s_sta_netif != NULL && esp_netif_get_ip_info(s_sta_netif, &sta_ip) == ESP_OK &&
+        sta_ip.ip.addr != 0 &&
+        (peer.sin_addr.s_addr & sta_ip.netmask.addr) ==
+            (sta_ip.ip.addr & sta_ip.netmask.addr)) {
+        return false;
+    }
+    return true;
+}
+
+static esp_err_t require_ota_access(httpd_req_t *request, bool require_window)
+{
+    network_service();
+    if (require_window && !s_maintenance_active) {
+        return send_json_error(request, "403 Forbidden",
+                               "use the physical 4,5,4,5 gesture to open maintenance");
+    }
+    if (request_is_from_ap(request)) {
+        return ESP_OK;
+    }
+    return require_authorization(request);
 }
 
 static esp_err_t receive_body(httpd_req_t *request, char *body, size_t capacity)
@@ -348,7 +505,7 @@ static esp_err_t root_get_handler(httpd_req_t *request)
     }
     httpd_resp_set_type(request, "text/plain");
     return httpd_resp_sendstr(request,
-                              "HPA300 local API\nGET /api/v1/device\nGET /api/v1/state\nPUT /api/v1/fan\n");
+                              "HPA300 local API\nGET /api/v1/device\nGET /api/v1/state\nPUT /api/v1/fan\nGET /update\n");
 }
 
 static esp_err_t device_get_handler(httpd_req_t *request)
@@ -369,6 +526,7 @@ static esp_err_t device_get_handler(httpd_req_t *request)
     cJSON_AddStringToObject(json, "api_version", "1");
     cJSON_AddStringToObject(json, "firmware_version", app->version);
     cJSON_AddNumberToObject(json, "speed_count", 4);
+    add_boot_diagnostics(json);
     esp_err_t err = send_json(request, json);
     cJSON_Delete(json);
     return err;
@@ -418,10 +576,259 @@ static esp_err_t fan_put_handler(httpd_req_t *request)
     return err;
 }
 
+static esp_err_t update_page_get_handler(httpd_req_t *request)
+{
+    httpd_resp_set_type(request, "text/html");
+    return httpd_resp_send(request, update_html_start,
+                           update_html_end - update_html_start);
+}
+
+static esp_err_t connectivity_check_get_handler(httpd_req_t *request)
+{
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    if (strcmp(request->uri, "/generate_204") == 0) {
+        httpd_resp_set_status(request, "204 No Content");
+        return httpd_resp_send(request, NULL, 0);
+    }
+    httpd_resp_set_type(request, "text/plain");
+    if (strcmp(request->uri, "/ncsi.txt") == 0) {
+        return httpd_resp_sendstr(request, "Microsoft NCSI");
+    }
+    if (strcmp(request->uri, "/hotspot-detect.html") == 0) {
+        return httpd_resp_sendstr(request, "Success");
+    }
+    return httpd_resp_sendstr(request, "Microsoft Connect Test");
+}
+
+static esp_err_t ota_status_get_handler(httpd_req_t *request)
+{
+    esp_err_t access = require_ota_access(request, false);
+    if (access != ESP_OK) {
+        return access;
+    }
+    ota_update_info_t info;
+    if (ota_update_get_info(&info) != ESP_OK) {
+        return send_json_error(request, "500 Internal Server Error",
+                               "failed to read OTA partitions");
+    }
+    cJSON *json = cJSON_CreateObject();
+    if (json == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddStringToObject(json, "version", info.running_version);
+    cJSON_AddStringToObject(json, "slot", info.running_slot);
+    const esp_partition_t *inactive = esp_ota_get_next_update_partition(NULL);
+    if (inactive != NULL) {
+        cJSON_AddNumberToObject(json, "max_image_bytes", inactive->size);
+    }
+    cJSON_AddBoolToObject(json, "maintenance_active", s_maintenance_active);
+    cJSON_AddBoolToObject(json, "busy", network_ota_is_busy());
+    cJSON_AddBoolToObject(json, "previous_available", info.previous_available);
+    if (info.previous_available) {
+        cJSON_AddStringToObject(json, "previous_version", info.previous_version);
+        cJSON_AddStringToObject(json, "previous_slot", info.previous_slot);
+    }
+    if (s_last_ota_result[0] != '\0') {
+        cJSON_AddStringToObject(json, "last_result", s_last_ota_result);
+    }
+    add_boot_diagnostics(json);
+    esp_err_t err = send_json(request, json);
+    cJSON_Delete(json);
+    return err;
+}
+
+static esp_err_t ota_failure(httpd_req_t *request, esp_err_t cause,
+                             const char *message)
+{
+    ota_update_abort();
+    s_ota_request_active = false;
+    update_network_led();
+    snprintf(s_last_ota_result, sizeof(s_last_ota_result), "failed: %s",
+             esp_err_to_name(cause));
+    ESP_LOGE(TAG, "%s: %s", message, esp_err_to_name(cause));
+    if (cause == ESP_ERR_INVALID_STATE || cause == ESP_ERR_OTA_ROLLBACK_INVALID_STATE) {
+        return send_json_error(request, "409 Conflict", message);
+    }
+    if (cause == ESP_ERR_INVALID_SIZE) {
+        return send_json_error(request, "413 Payload Too Large", message);
+    }
+    if (cause == ESP_ERR_OTA_VALIDATE_FAILED || cause == ESP_ERR_INVALID_ARG) {
+        return send_json_error(request, "422 Unprocessable Entity", message);
+    }
+    return send_json_error(request, "500 Internal Server Error", message);
+}
+
+static esp_err_t ota_post_handler(httpd_req_t *request)
+{
+    esp_err_t access = require_ota_access(request, true);
+    if (access != ESP_OK) {
+        return access;
+    }
+    if (network_ota_is_busy()) {
+        return send_json_error(request, "409 Conflict", "a firmware update is already active");
+    }
+    if (request->content_len <= 0) {
+        return send_json_error(request, "422 Unprocessable Entity", "firmware body is required");
+    }
+    const esp_partition_t *inactive = esp_ota_get_next_update_partition(NULL);
+    if (inactive == NULL) {
+        return send_json_error(request, "500 Internal Server Error",
+                               "inactive OTA partition was not found");
+    }
+    if (request->content_len > inactive->size) {
+        snprintf(s_last_ota_result, sizeof(s_last_ota_result),
+                 "failed: image too large");
+        return send_json_error_and_close(request, "413 Payload Too Large",
+                                         "firmware exceeds the inactive OTA partition");
+    }
+    // Reserve the maintenance window before receiving the preflight bytes. A
+    // slow AP upload that began in time must not have its interface disabled.
+    s_ota_request_active = true;
+
+    uint8_t *buffer = malloc(OTA_RECEIVE_BUFFER_SIZE);
+    if (buffer == NULL) {
+        s_ota_request_active = false;
+        return send_json_error(request, "500 Internal Server Error", "OTA buffer allocation failed");
+    }
+    size_t expected = (size_t)request->content_len;
+    size_t preflight_length = expected < OTA_PREFLIGHT_BUFFER_SIZE
+                                  ? expected
+                                  : OTA_PREFLIGHT_BUFFER_SIZE;
+    size_t received = 0;
+    while (received < preflight_length) {
+        int count = httpd_req_recv(request, (char *)buffer + received,
+                                   preflight_length - received);
+        if (count <= 0) {
+            free(buffer);
+            esp_err_t response =
+                ota_failure(request, ESP_FAIL, "firmware upload was interrupted");
+            close_upload_session(request);
+            return response;
+        }
+        received += (size_t)count;
+    }
+
+    if (controller_set_remote_fan_speed(FAN_SPEED_OFF) != ESP_OK) {
+        free(buffer);
+        return ota_failure(request, ESP_FAIL, "failed to stop the fan safely");
+    }
+    controller_set_network_status(CONTROLLER_NETWORK_UPDATING);
+
+    char new_version[sizeof(((esp_app_desc_t *)0)->version)];
+    esp_err_t err = ota_update_begin(buffer, received, expected,
+                                     new_version, sizeof(new_version));
+    if (err != ESP_OK) {
+        free(buffer);
+        esp_err_t response = ota_failure(request, err, "firmware header is invalid");
+        close_upload_session(request);
+        return response;
+    }
+    err = ota_update_write(buffer, received);
+    size_t total = received;
+    while (err == ESP_OK && total < expected) {
+        size_t wanted = expected - total;
+        if (wanted > OTA_RECEIVE_BUFFER_SIZE) {
+            wanted = OTA_RECEIVE_BUFFER_SIZE;
+        }
+        int count = httpd_req_recv(request, (char *)buffer, wanted);
+        if (count <= 0) {
+            err = ESP_FAIL;
+            break;
+        }
+        err = ota_update_write(buffer, (size_t)count);
+        total += (size_t)count;
+    }
+    free(buffer);
+    if (err != ESP_OK) {
+        bool incomplete = total < expected;
+        esp_err_t response = ota_failure(request, err, incomplete
+                                                          ? "firmware upload was interrupted"
+                                                          : "firmware write failed");
+        if (incomplete) {
+            close_upload_session(request);
+        }
+        return response;
+    }
+
+    err = ota_update_finish();
+    if (err != ESP_OK) {
+        return ota_failure(request, err, "firmware image or signature is invalid");
+    }
+
+    const esp_app_desc_t *running = esp_app_get_description();
+    snprintf(s_last_ota_result, sizeof(s_last_ota_result), "installed %s", new_version);
+    maintenance_close(true);
+    bool restarting =
+        xTaskCreate(restart_task, "ota_restart", 2048,
+                    (void *)(intptr_t)DIAGNOSTICS_RESTART_OTA, 5, NULL) == pdPASS;
+    if (!restarting) {
+        s_ota_request_active = false;
+        update_network_led();
+        strlcpy(s_last_ota_result, "installed; manual restart required",
+                sizeof(s_last_ota_result));
+        ESP_LOGE(TAG, "firmware installed but restart task could not be created");
+    }
+    cJSON *json = cJSON_CreateObject();
+    if (json == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddBoolToObject(json, "accepted", true);
+    cJSON_AddStringToObject(json, "from_version", running->version);
+    cJSON_AddStringToObject(json, "to_version", new_version);
+    cJSON_AddBoolToObject(json, "restarting", restarting);
+    esp_err_t response_err = send_json(request, json);
+    cJSON_Delete(json);
+    return response_err;
+}
+
+static esp_err_t ota_rollback_post_handler(httpd_req_t *request)
+{
+    esp_err_t access = require_ota_access(request, true);
+    if (access != ESP_OK) {
+        return access;
+    }
+    if (network_ota_is_busy()) {
+        return send_json_error(request, "409 Conflict", "a firmware update is active");
+    }
+    if (controller_set_remote_fan_speed(FAN_SPEED_OFF) != ESP_OK) {
+        return ota_failure(request, ESP_FAIL, "failed to stop the fan safely");
+    }
+    s_ota_request_active = true;
+    controller_set_network_status(CONTROLLER_NETWORK_UPDATING);
+    esp_err_t err = ota_update_select_previous();
+    if (err == ESP_ERR_NOT_FOUND) {
+        s_ota_request_active = false;
+        update_network_led();
+        return send_json_error(request, "409 Conflict", "no previous firmware is available");
+    }
+    if (err != ESP_OK) {
+        return ota_failure(request, err, "previous firmware failed validation");
+    }
+
+    maintenance_close(true);
+    bool restarting =
+        xTaskCreate(restart_task, "rollback_restart", 2048,
+                    (void *)(intptr_t)DIAGNOSTICS_RESTART_ROLLBACK, 5, NULL) == pdPASS;
+    if (!restarting) {
+        s_ota_request_active = false;
+        update_network_led();
+        ESP_LOGE(TAG, "previous firmware selected but restart task could not be created");
+    }
+    cJSON *json = cJSON_CreateObject();
+    if (json == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddBoolToObject(json, "accepted", true);
+    cJSON_AddBoolToObject(json, "restarting", restarting);
+    esp_err_t response_err = send_json(request, json);
+    cJSON_Delete(json);
+    return response_err;
+}
+
 static void restart_task(void *arg)
 {
-    (void)arg;
     vTaskDelay(pdMS_TO_TICKS(1500));
+    diagnostics_mark_planned_restart((diagnostics_restart_t)(intptr_t)arg);
     esp_restart();
 }
 
@@ -482,7 +889,9 @@ static esp_err_t provision_post_handler(httpd_req_t *request)
     cJSON_AddBoolToObject(response, "restarting", true);
     err = send_json(request, response);
     cJSON_Delete(response);
-    if (err == ESP_OK && xTaskCreate(restart_task, "restart", 2048, NULL, 5, NULL) != pdPASS) {
+    if (err == ESP_OK &&
+        xTaskCreate(restart_task, "restart", 2048,
+                    (void *)(intptr_t)DIAGNOSTICS_RESTART_PROVISIONING, 5, NULL) != pdPASS) {
         ESP_LOGE(TAG, "configuration saved but restart task could not be created");
     }
     return err;
@@ -503,6 +912,7 @@ static esp_err_t start_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
+    config.max_uri_handlers = 16;
     ESP_RETURN_ON_ERROR(httpd_start(&s_http_server, &config), TAG, "failed to start HTTP server");
 
     const httpd_uri_t handlers[] = {
@@ -511,6 +921,14 @@ static esp_err_t start_http_server(void)
         { .uri = "/api/v1/state", .method = HTTP_GET, .handler = state_get_handler },
         { .uri = "/api/v1/fan", .method = HTTP_PUT, .handler = fan_put_handler },
         { .uri = "/api/v1/provision", .method = HTTP_POST, .handler = provision_post_handler },
+        { .uri = "/update", .method = HTTP_GET, .handler = update_page_get_handler },
+        { .uri = "/api/v1/ota", .method = HTTP_GET, .handler = ota_status_get_handler },
+        { .uri = "/api/v1/ota", .method = HTTP_POST, .handler = ota_post_handler },
+        { .uri = "/api/v1/ota/rollback", .method = HTTP_POST, .handler = ota_rollback_post_handler },
+        { .uri = "/connecttest.txt", .method = HTTP_GET, .handler = connectivity_check_get_handler },
+        { .uri = "/ncsi.txt", .method = HTTP_GET, .handler = connectivity_check_get_handler },
+        { .uri = "/generate_204", .method = HTTP_GET, .handler = connectivity_check_get_handler },
+        { .uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = connectivity_check_get_handler },
     };
     for (size_t i = 0; i < sizeof(handlers) / sizeof(handlers[0]); i++) {
         ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_http_server, &handlers[i]), TAG,
@@ -533,9 +951,10 @@ esp_err_t network_init(void)
     ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "failed to initialize TCP/IP stack");
     ESP_RETURN_ON_ERROR(esp_event_loop_create_default(), TAG, "failed to create event loop");
 
-    esp_netif_create_default_wifi_sta();
+    s_sta_netif = esp_netif_create_default_wifi_sta();
     s_ap_netif = esp_netif_create_default_wifi_ap();
-    ESP_RETURN_ON_FALSE(s_ap_netif != NULL, ESP_ERR_NO_MEM, TAG, "failed to create AP interface");
+    ESP_RETURN_ON_FALSE(s_sta_netif != NULL && s_ap_netif != NULL, ESP_ERR_NO_MEM, TAG,
+                        "failed to create Wi-Fi interfaces");
 
     wifi_init_config_t init_config = WIFI_INIT_CONFIG_DEFAULT();
     ESP_RETURN_ON_ERROR(esp_wifi_init(&init_config), TAG, "failed to initialize Wi-Fi");
@@ -579,6 +998,14 @@ esp_err_t network_init(void)
 esp_err_t network_start_provisioning(void)
 {
     ESP_RETURN_ON_FALSE(s_wifi_started, ESP_ERR_INVALID_STATE, TAG, "network is not initialized");
-    ESP_LOGW(TAG, "physical setup gesture accepted");
-    return provisioning_enable(true);
+    if (!s_maintenance_active) {
+        s_maintenance_keep_ap = !s_has_wifi_credentials || s_api_token[0] == '\0' ||
+                                (s_provisioning && !s_provisioning_forced);
+    }
+    ESP_RETURN_ON_ERROR(provisioning_enable(true), TAG,
+                        "failed to enable maintenance access point");
+    s_maintenance_active = true;
+    s_maintenance_started = xTaskGetTickCount();
+    ESP_LOGW(TAG, "physical setup gesture accepted; firmware maintenance open for ten minutes");
+    return ESP_OK;
 }

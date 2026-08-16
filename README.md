@@ -17,6 +17,35 @@ idf.py set-target esp32s2
 idf.py build
 ```
 
+The application uses size optimization and a dual-slot OTA partition table.
+Builds require a local RSA-3072 signing key at
+`secrets/hpa300-ota-signing-key.pem`; the directory is ignored by Git. Generate
+the key once from an ESP-IDF terminal and keep encrypted off-machine backups:
+
+```text
+espsecure.py generate_signing_key --version 2 --scheme rsa3072 secrets/hpa300-ota-signing-key.pem
+```
+
+An ordinary build produces `build/HPA300-FIRMWARE-unsigned.bin` and the signed
+`build/HPA300-FIRMWARE.bin`. Only the signed file may be flashed or uploaded.
+The build fails if the signed image leaves less than 64 KiB in an OTA slot. A
+release should be made from a clean, tagged commit and verified before use:
+
+```text
+espsecure.py verify_signature --version 2 --keyfile secrets/hpa300-ota-signing-key.pem build/HPA300-FIRMWARE.bin
+```
+
+On Windows, run the check from an activated ESP-IDF terminal and use
+`espsecure.exe` in place of `espsecure.py`.
+
+A clean commit with an exact `v*` tag embeds that tag as the application
+version. Untagged or dirty development builds embed the commit plus a UTC
+configure timestamp, for example `168c0e9-dev-20260815T153000Z`, so consecutive
+bench images are distinguishable. Run `idf.py fullclean build` when deliberately
+producing a new development image. CI or a release candidate can override the
+value before configuration with `$env:HPA300_VERSION = "v1.0.0-rc1"` in
+PowerShell. Versions must fit ESP-IDF's 31-character application-version field.
+
 The ESP32-S2 application console uses the board's native USB-C connection via
 USB CDC. For an initial flash, hold Boot, tap Reset, then release Boot to enter
 ROM download mode. After flashing, the application console may enumerate under
@@ -49,16 +78,17 @@ LED2 (the Check Filters indicator) also shows network status:
 | Fast blink | Provisioning portal active |
 | Slow blink | Connecting or waiting to retry |
 | Solid | Wi-Fi connected and HTTP API ready |
+| Very fast blink | Firmware upload in progress |
 | Off | Network subsystem unavailable |
 
 LED2 uses the panel's shared brightness setting, so it is intentionally dark
 when the user-selected LED brightness is Off.
 
-After enrollment, the setup portal can only be reopened by tapping keys
-`4, 5, 4, 5` within ten seconds. A Wi-Fi outage by itself never exposes the
-unauthenticated setup portal. Reserve the controller's address in the router's
-DHCP configuration because this phase intentionally does not use mDNS or
-Zeroconf.
+After enrollment, tapping keys `4, 5, 4, 5` within ten seconds opens a
+ten-minute physical maintenance window and enables the setup AP in AP+STA mode.
+A Wi-Fi outage by itself never exposes the unauthenticated setup portal or
+permits a firmware write. Reserve the controller's address in the router's DHCP
+configuration because this phase intentionally does not use mDNS or Zeroconf.
 
 The version 1 HTTP API listens on port 80:
 
@@ -67,17 +97,106 @@ The version 1 HTTP API listens on port 80:
 | `GET` | `/api/v1/device` | Stable device ID, firmware/API versions, and capabilities |
 | `GET` | `/api/v1/state` | Selected fan speed, power, change source, timer, and LED state |
 | `PUT` | `/api/v1/fan` | Select fan speed with `{"speed": 0}` through `{"speed": 4}` |
+| `GET` | `/api/v1/ota` | Running slot/version, maintenance state, and previous firmware |
+| `POST` | `/api/v1/ota` | Stream a signed application image into the inactive OTA slot |
+| `POST` | `/api/v1/ota/rollback` | Validate and boot the previous firmware slot |
 
-All operational API requests require `Authorization: Bearer <token>`. The token
-is protected from unauthenticated API clients, but HTTP does not encrypt it on
-the LAN. Use this phase on a trusted network. A REST fan package example is in
+Operational API requests require `Authorization: Bearer <token>`; the only
+exception is signed OTA recovery through the AP during a physical maintenance
+window. The token is protected from unauthenticated API clients, but HTTP does
+not encrypt it on the LAN. Use this phase on a trusted network. A REST fan package example is in
 `home-assistant/hpa300.yaml.example`; it polls actual controller state every
 five seconds and exposes a standard Home Assistant fan with four 25% steps.
 Copy it into a Home Assistant packages directory, add the documented URLs and
 authorization value to `secrets.yaml`, and reserve the purifier's DHCP address.
 
+The package also defines a read-only `sensor.hpa300_diagnostics` heartbeat. It
+polls `/api/v1/device` every 30 seconds and records every response, including
+the firmware version and `last_boot` reset details, so overnight availability
+and reboot causes can be reviewed in Home Assistant History. Remove
+`force_update: true` after active troubleshooting if the per-poll history is no
+longer useful.
+
+`GET /api/v1/device` and `GET /api/v1/ota` include a `last_boot` object with
+the ESP-IDF reset name/code, whether it is power-related, and whether a software
+reset was deliberately scheduled for OTA, rollback, or provisioning. The same
+information appears on `/update`. Reset causes and planned-reset markers use
+reset/RTC memory only; collecting these diagnostics never writes flash during a
+power failure.
+
 Commands received through the REST API cancel any active local timed-off mode,
 so a manual timer cannot unexpectedly defeat Home Assistant control.
+
+## Firmware updates
+
+Before making USB or service-pad access difficult, complete the
+[pre-assembly test plan](docs/preassembly-test-plan.md).
+
+Open `http://<controller-address>/update`, enter the API token, perform the
+physical `4, 5, 4, 5` gesture, and select the signed
+`build/HPA300-FIRMWARE.bin`. The same page is available through the temporary
+`HPA300-xxxxxx` AP at `http://192.168.4.1/update`. LAN uploads require the API
+token. AP uploads require the physical maintenance window and a firmware image
+signed by the controller's current signing key, so recovery remains possible
+if the stored token is unavailable.
+
+OTA startup erases the entire inactive application partition before streaming,
+including the Secure Boot v2 signature sector. This prevents a shorter or
+unsigned upload from inheriting a valid signature left by an older image.
+
+The equivalent LAN command is:
+
+```powershell
+$env:HPA300_TOKEN = "your-private-token"
+curl.exe --fail-with-body `
+  -H "Authorization: Bearer $env:HPA300_TOKEN" `
+  -H "Content-Type: application/octet-stream" `
+  --data-binary "@build/HPA300-FIRMWARE.bin" `
+  "http://CONTROLLER-IP/api/v1/ota"
+```
+
+An upload stops the fan, rejects the wrong chip/project and images larger than
+the inactive slot, and streams directly to flash. ESP-IDF validates the full
+image and RSA signature before changing the boot partition. The new image then
+has a 30-second probation period; failure to initialize the controller and HTTP
+server, or a reset before confirmation, returns to the previous slot. Router or
+Internet connectivity is not required to pass probation. The update page also
+allows a physically authorized return to the previous valid slot.
+
+## First OTA-capable installation and UART recovery
+
+The currently shipped single-app partition table must be replaced once over a
+wired ROM-download connection. Before erasing anything, hold Boot, tap Reset,
+release Boot, and confirm the physical flash size:
+
+```text
+esptool.py --chip esp32s2 -p COMx flash_id
+```
+
+This controller reports 4 MB, so the project defaults to `partitions-4mb.csv`
+with two 1.875 MiB OTA slots. `partitions.csv` remains available for a verified
+2 MB board, but must never be replaced by the 4 MB layout unless `flash_id`
+reports sufficient capacity. Then perform the one-time migration:
+
+```text
+idf.py fullclean build
+espsecure.py verify_signature --version 2 --keyfile secrets/hpa300-ota-signing-key.pem build/HPA300-FIRMWARE.bin
+idf.py -p COMx erase-flash
+idf.py -p COMx flash monitor
+```
+
+Erasing is intentional because the new OTA metadata overlaps the old NVS
+layout; Wi-Fi and the API token must be provisioned again. Confirm the boot log
+reports `ota_0` before closing the enclosure.
+
+Hardware Secure Boot, flash encryption, anti-rollback eFuses, and ROM download
+restrictions remain disabled. If OTA and networking are unusable, reopen the
+enclosure, reach Boot/Reset plus native USB or the TC2030 UART pads, enter ROM
+download mode, and repeat `idf.py erase-flash` followed by `idf.py flash`. This
+can replace the bootloader, partition table, firmware, and signing key. Keep the
+service pads accessible and record their enclosure location before packaging.
+Complete the hardware acceptance checklist in `docs/ota-validation.md` before
+making the wired service connection difficult to reach.
 
 ## Safety model
 

@@ -2,6 +2,7 @@
 #
 # Add these values to secrets.yaml before including this package:
 #   hpa300_state_url: "http://192.168.1.50/api/v1/state"
+#   hpa300_device_url: "http://192.168.1.50/api/v1/device"
 #   hpa300_fan_url: "http://192.168.1.50/api/v1/fan"
 #   hpa300_authorization: "Bearer replace-with-the-token-entered-during-setup"
 
@@ -22,6 +23,22 @@ rest:
           - timer
           - led_brightness
           - wifi_connected
+
+  # Read-only overnight heartbeat and reboot diagnostics. force_update makes
+  # Recorder retain every poll even when the reset reason has not changed.
+  - resource: !secret hpa300_device_url
+    scan_interval: 30
+    timeout: 3
+    headers:
+      Authorization: !secret hpa300_authorization
+    sensor:
+      - name: HPA300 Diagnostics
+        unique_id: hpa300_rest_diagnostics
+        force_update: true
+        value_template: "{{ value_json.last_boot.reason | default('unknown') }}"
+        json_attributes:
+          - firmware_version
+          - last_boot
 
 rest_command:
   hpa300_set_speed:

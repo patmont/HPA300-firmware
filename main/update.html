@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>HPA300 firmware update</title>
+  <style>
+    body{font:16px system-ui,sans-serif;max-width:36rem;margin:3rem auto;padding:0 1rem;color:#17202a}
+    label{display:block;margin:1rem 0 .3rem}input{box-sizing:border-box;width:100%;padding:.7rem}
+    button{margin:.8rem .5rem 0 0;padding:.8rem 1.2rem}button.danger{color:#8b0000}
+    progress{box-sizing:border-box;width:100%;height:1.2rem;margin-top:1rem}
+    #device,#status{margin-top:1rem;white-space:pre-wrap}.muted{color:#59636e}
+  </style>
+</head>
+<body>
+  <h1>HPA300 firmware update</h1>
+  <p>Tap keys <strong>4, 5, 4, 5</strong> on the purifier before updating. The maintenance window remains open for ten minutes.</p>
+  <label for="token">API token (required over the normal LAN)</label>
+  <input id="token" type="password" minlength="16" maxlength="64" autocomplete="current-password">
+  <button id="refresh" type="button">Read device</button>
+  <div id="device" class="muted">Device status has not been read.</div>
+  <form id="upload">
+    <label for="firmware">Signed HPA300 firmware (.bin)</label>
+    <input id="firmware" type="file" accept=".bin,application/octet-stream" required>
+    <button id="install" type="submit">Install firmware</button>
+  </form>
+  <progress id="progress" max="100" value="0" hidden></progress>
+  <button id="rollback" class="danger" type="button" hidden>Boot previous firmware</button>
+  <div id="status" role="status"></div>
+  <script>
+    const token=document.getElementById('token'),device=document.getElementById('device'),
+      status=document.getElementById('status'),progress=document.getElementById('progress'),
+      rollback=document.getElementById('rollback'),install=document.getElementById('install'),
+      firmware=document.getElementById('firmware');
+    let maxImageBytes=0;
+    function headers(){return token.value?{'Authorization':`Bearer ${token.value}`}:{}}
+    function setBusy(busy){install.disabled=busy;rollback.disabled=busy;document.getElementById('refresh').disabled=busy}
+    async function readDevice(){
+      status.textContent='Reading device...';
+      try{
+        const response=await fetch('/api/v1/ota',{headers:headers()}),result=await response.json();
+        if(!response.ok)throw new Error(result.error||`HTTP ${response.status}`);
+        maxImageBytes=result.max_image_bytes||0;
+        const boot=result.last_boot;
+        const bootText=boot?`\nLast boot: ${boot.reason} (${boot.code})${boot.planned?` — planned: ${boot.planned_reason}`:''}${boot.power_related?' — power-related':''}`:'';
+        device.textContent=`Running ${result.version} from ${result.slot}\nMaximum image: ${maxImageBytes||'unknown'} bytes\nMaintenance window: ${result.maintenance_active?'open':'closed'}${bootText}${result.previous_available?`\nPrevious: ${result.previous_version} (${result.previous_slot})`:''}${result.last_result?`\nLast update: ${result.last_result}`:''}`;
+        rollback.hidden=!result.previous_available||!result.maintenance_active;
+        status.textContent=result.maintenance_active?'Ready. Select a signed firmware file.':'Use the physical gesture to open the maintenance window.';
+      }catch(error){status.textContent=`Could not read device: ${error.message}`}
+    }
+    document.getElementById('refresh').addEventListener('click',readDevice);
+    document.getElementById('upload').addEventListener('submit',event=>{
+      event.preventDefault();
+      const file=firmware.files[0];if(!file)return;
+      if(maxImageBytes&&file.size>maxImageBytes){status.textContent=`Update refused locally: ${file.size} bytes exceeds the ${maxImageBytes}-byte OTA slot.`;return}
+      if(!confirm(`Stop the fan and install ${file.name} (${file.size} bytes)?`))return;
+      setBusy(true);progress.hidden=false;progress.value=0;status.textContent='Uploading...';
+      const request=new XMLHttpRequest();request.open('POST','/api/v1/ota');
+      request.setRequestHeader('Content-Type','application/octet-stream');
+      if(token.value)request.setRequestHeader('Authorization',`Bearer ${token.value}`);
+      request.upload.onprogress=e=>{if(e.lengthComputable)progress.value=e.loaded*100/e.total};
+      request.onload=()=>{setBusy(false);let result={};try{result=JSON.parse(request.responseText)}catch(_error){}
+        if(request.status>=200&&request.status<300){progress.value=100;status.textContent=`Installed ${result.to_version||file.name}. ${result.restarting?'The purifier is restarting.':'Restart the purifier manually to boot it.'}`;rollback.hidden=true}
+        else status.textContent=`Update failed (HTTP ${request.status}): ${result.error||'no error detail'}`};
+      request.onerror=()=>{setBusy(false);status.textContent='Update failed: network connection lost.'};request.send(file);
+    });
+    rollback.addEventListener('click',async()=>{
+      if(!confirm('Reboot into the previous firmware?'))return;setBusy(true);status.textContent='Selecting previous firmware...';
+      try{const response=await fetch('/api/v1/ota/rollback',{method:'POST',headers:headers()}),result=await response.json();
+        if(!response.ok)throw new Error(result.error||`HTTP ${response.status}`);status.textContent=result.restarting?'Previous firmware selected. The purifier is restarting.':'Previous firmware selected. Restart the purifier manually.'}
+      catch(error){setBusy(false);status.textContent=`Rollback failed: ${error.message}`}
+    });
+    readDevice();
+  </script>
+</body>
+</html>
