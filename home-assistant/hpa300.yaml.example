@@ -39,6 +39,7 @@ rest:
         json_attributes:
           - firmware_version
           - last_boot
+          - runtime
 
 rest_command:
   hpa300_set_speed:

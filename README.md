@@ -112,10 +112,20 @@ authorization value to `secrets.yaml`, and reserve the purifier's DHCP address.
 
 The package also defines a read-only `sensor.hpa300_diagnostics` heartbeat. It
 polls `/api/v1/device` every 30 seconds and records every response, including
-the firmware version and `last_boot` reset details, so overnight availability
-and reboot causes can be reviewed in Home Assistant History. Remove
+the firmware version, `last_boot` reset details, and runtime uptime/free-heap
+watermarks, so overnight availability and reboot causes can be reviewed in
+Home Assistant History. Remove
 `force_update: true` after active troubleshooting if the per-poll history is no
 longer useful.
+
+Crash dumps use the compact binary format and are stored in the dedicated
+64 KiB coredump partition. The first crash is retained across a later reset
+cascade. Keep the matching `build/HPA300-FIRMWARE.elf`; with the affected unit
+in ROM download mode, inspect the retained dump before reflashing:
+
+```text
+idf.py -p COMx coredump-info
+```
 
 `GET /api/v1/device` and `GET /api/v1/ota` include a `last_boot` object with
 the ESP-IDF reset name/code, whether it is power-related, and whether a software

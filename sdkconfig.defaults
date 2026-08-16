@@ -2,6 +2,11 @@
 CONFIG_IDF_TARGET="esp32s2"
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
+# Favor flash margin over peak execute-in-place throughput. The purifier is a
+# noisy, warm environment, and 40 MHz is less sensitive to marginal flash
+# timing than the previous 80 MHz setting.
+CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
+
 # The board's USB-C connector is wired directly to the ESP32-S2 USB peripheral;
 # keep the application console on that connector rather than requiring the
 # separate TC2030 UART cable.
@@ -15,6 +20,14 @@ CONFIG_ESP32S2_KEEP_USB_ALIVE=y
 CONFIG_ESP_BROWNOUT_DET=y
 CONFIG_ESP_BROWNOUT_DET_LVL_SEL_7=y
 CONFIG_SPI_FLASH_BROWNOUT_RESET=y
+
+# Preserve the first crash in a reset cascade. Binary dumps fit the existing
+# 64 KiB coredump partition and can be decoded against the matching ELF.
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_BIN=y
+CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
+CONFIG_ESP_COREDUMP_FLASH_NO_OVERWRITE=y
+CONFIG_ESP_COREDUMP_MAX_TASKS_NUM=24
 
 # A 2 MB controller has two 960 KiB OTA slots. Optimize for size to preserve
 # at least 64 KiB of growth/metadata headroom in the signed release image.

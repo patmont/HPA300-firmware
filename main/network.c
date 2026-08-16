@@ -18,6 +18,7 @@
 #include "esp_netif.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_wifi_ap_get_sta_list.h"
 #include "freertos/FreeRTOS.h"
@@ -339,6 +340,16 @@ static void add_boot_diagnostics(cJSON *json)
     if (boot->planned) {
         cJSON_AddStringToObject(reset, "planned_reason", boot->planned_reason);
     }
+
+    cJSON *runtime = cJSON_AddObjectToObject(json, "runtime");
+    if (runtime == NULL) {
+        return;
+    }
+    cJSON_AddNumberToObject(runtime, "uptime_seconds",
+                            (double)(esp_timer_get_time() / UINT64_C(1000000)));
+    cJSON_AddNumberToObject(runtime, "free_heap_bytes", esp_get_free_heap_size());
+    cJSON_AddNumberToObject(runtime, "minimum_free_heap_bytes",
+                            esp_get_minimum_free_heap_size());
 }
 
 static void close_upload_session(httpd_req_t *request)
