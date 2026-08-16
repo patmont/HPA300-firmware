@@ -144,10 +144,9 @@ esp_err_t hc238_enable(bool en)
 
 // Set the HC238 output based on the provided index (0-7)
 // where index 3-bit binary value corresponds to A2, A1, A0 inputs
-esp_err_t hc238_set_output(uint8_t index)
+esp_err_t hc238_set_address(uint8_t index)
 {
     ESP_RETURN_ON_FALSE(g_initialized, ESP_ERR_INVALID_STATE, TAG, "driver is not initialized");
-    ESP_RETURN_ON_ERROR(hc238_enable(false), TAG, "failed to disable outputs");
     ESP_RETURN_ON_FALSE(index <= 7, ESP_ERR_INVALID_ARG, TAG, "output index must be 0-7");
 
     // Extract index value bits from for A0, A1, A2
@@ -174,4 +173,10 @@ esp_err_t hc238_set_output(uint8_t index)
     }
 
     return ESP_OK;
+}
+
+esp_err_t hc238_set_output(uint8_t index)
+{
+    ESP_RETURN_ON_ERROR(hc238_enable(false), TAG, "failed to disable outputs");
+    return hc238_set_address(index);
 }

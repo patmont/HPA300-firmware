@@ -27,6 +27,10 @@ typedef struct {
 } hc238_config_t;
 
 esp_err_t hc238_init(const hc238_config_t *cfg);
+// Change only the decoder address. The caller is responsible for disabling
+// the decoder first; this split lets safety-critical callers prove that every
+// transition has exactly one disable/address/enable sequence.
+esp_err_t hc238_set_address(uint8_t index);
 esp_err_t hc238_set_output(uint8_t index);
 esp_err_t hc238_enable(bool en);
 

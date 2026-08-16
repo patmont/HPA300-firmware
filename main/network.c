@@ -38,6 +38,7 @@
 #define OTA_MAINTENANCE_WINDOW_MS (10 * 60 * 1000)
 #define OTA_RECEIVE_BUFFER_SIZE 4096
 #define OTA_PREFLIGHT_BUFFER_SIZE 512
+#define FAN_QUIESCE_TIMEOUT_MS 250
 
 extern const char provision_html_start[] asm("_binary_provision_html_start");
 extern const char provision_html_end[] asm("_binary_provision_html_end");
@@ -350,6 +351,72 @@ static void add_boot_diagnostics(cJSON *json)
     cJSON_AddNumberToObject(runtime, "free_heap_bytes", esp_get_free_heap_size());
     cJSON_AddNumberToObject(runtime, "minimum_free_heap_bytes",
                             esp_get_minimum_free_heap_size());
+
+    fan_control_snapshot_t control;
+    if (fan_control_get_snapshot(&control) == ESP_OK) {
+        cJSON *health = cJSON_AddObjectToObject(json, "control_health");
+        if (health != NULL) {
+            cJSON_AddStringToObject(health, "state", fan_control_state_name(control.state));
+            cJSON_AddNumberToObject(health, "desired_speed", control.desired_speed);
+            cJSON_AddNumberToObject(health, "applied_speed", control.applied_speed);
+            cJSON_AddBoolToObject(health, "pending", control.pending);
+            cJSON_AddBoolToObject(health, "fault_latched", control.fault_latched);
+            cJSON_AddBoolToObject(health, "maintenance_active", control.maintenance_active);
+            cJSON_AddNumberToObject(health, "accepted_sequence", control.accepted_sequence);
+            cJSON_AddNumberToObject(health, "applied_sequence", control.applied_sequence);
+            cJSON_AddNumberToObject(health, "control_cycles", control.control_cycles);
+            cJSON_AddNumberToObject(health, "max_cycle_us", control.max_cycle_us);
+            cJSON_AddNumberToObject(health, "budget_overruns", control.budget_overruns);
+            cJSON_AddNumberToObject(health, "deadline_misses", control.deadline_misses);
+            cJSON_AddNumberToObject(health, "transitions_attempted", control.transitions_attempted);
+            cJSON_AddNumberToObject(health, "transitions_completed", control.transitions_completed);
+            cJSON_AddNumberToObject(health, "duplicate_commands", control.duplicate_commands);
+            cJSON_AddNumberToObject(health, "coalesced_commands", control.coalesced_commands);
+            cJSON_AddNumberToObject(health, "rejected_commands", control.rejected_commands);
+            cJSON_AddNumberToObject(health, "last_transition_us", control.last_transition_us);
+            cJSON_AddNumberToObject(health, "minimum_transition_interval_ms",
+                                    control.minimum_transition_interval_ms);
+            cJSON_AddNumberToObject(health, "maximum_transitions_per_minute",
+                                    control.maximum_transitions_per_minute);
+            cJSON_AddNumberToObject(health, "stack_min_free_bytes",
+                                    control.stack_min_free_bytes);
+        }
+        cJSON *fault = cJSON_AddObjectToObject(json, "last_fault");
+        if (fault != NULL) {
+            cJSON_AddBoolToObject(fault, "latched", control.fault_latched);
+            cJSON_AddNumberToObject(fault, "error", control.fault_error);
+            cJSON_AddStringToObject(fault, "phase", fan_control_phase_name(control.fault_phase));
+        }
+    }
+
+    diagnostics_flash_counters_t flash;
+    diagnostics_get_flash_counters(&flash);
+    cJSON *activity = cJSON_AddObjectToObject(json, "flash_activity");
+    if (activity != NULL) {
+        cJSON_AddBoolToObject(activity, "boot_scoped", true);
+        const diagnostics_flash_counter_t *values[] = { &flash.read, &flash.write, &flash.erase };
+        const char *names[] = { "read", "write", "erase" };
+        for (size_t i = 0; i < 3; ++i) {
+            cJSON *counter = cJSON_AddObjectToObject(activity, names[i]);
+            if (counter != NULL) {
+                cJSON_AddNumberToObject(counter, "operations", values[i]->count);
+                cJSON_AddNumberToObject(counter, "bytes", values[i]->bytes);
+                cJSON_AddNumberToObject(counter, "time_us", values[i]->time_us);
+            }
+        }
+    }
+
+    diagnostics_breadcrumb_t latest;
+    if (diagnostics_get_latest_event(&latest)) {
+        cJSON *event = cJSON_AddObjectToObject(json, "last_event");
+        if (event != NULL) {
+            cJSON_AddNumberToObject(event, "sequence", latest.sequence);
+            cJSON_AddStringToObject(event, "type", diagnostics_event_name(latest.event));
+            cJSON_AddNumberToObject(event, "uptime_ms", latest.uptime_ms);
+            cJSON_AddNumberToObject(event, "value", latest.value);
+            cJSON_AddNumberToObject(event, "detail", latest.detail);
+        }
+    }
 }
 
 static void close_upload_session(httpd_req_t *request)
@@ -499,11 +566,19 @@ static cJSON *make_state_json(void)
     }
     cJSON_AddBoolToObject(json, "power", state.fan_speed != FAN_SPEED_OFF);
     cJSON_AddNumberToObject(json, "speed", state.fan_speed);
+    cJSON_AddNumberToObject(json, "desired_speed", state.desired_speed);
     cJSON_AddNumberToObject(json, "percentage", state.fan_speed * 25);
     cJSON_AddStringToObject(json, "source", controller_source_name(state.last_change_source));
     cJSON_AddStringToObject(json, "timer", controller_shutoff_mode_name(state.shutoff_mode));
     cJSON_AddNumberToObject(json, "led_brightness", state.led_brightness_percent);
     cJSON_AddBoolToObject(json, "wifi_connected", s_connected);
+    cJSON_AddBoolToObject(json, "pending", state.pending);
+    cJSON_AddNumberToObject(json, "accepted_sequence", state.accepted_sequence);
+    cJSON_AddNumberToObject(json, "applied_sequence", state.applied_sequence);
+    cJSON_AddStringToObject(json, "control_state",
+                           fan_control_state_name(state.control_state));
+    cJSON_AddBoolToObject(json, "fault_latched", state.fault_latched);
+    cJSON_AddBoolToObject(json, "maintenance_active", state.maintenance_active);
     return json;
 }
 
@@ -575,15 +650,34 @@ static esp_err_t fan_put_handler(httpd_req_t *request)
     }
     fan_speed_t speed = (fan_speed_t)speed_json->valueint;
     cJSON_Delete(json);
-    if (controller_set_remote_fan_speed(speed) != ESP_OK) {
-        return send_json_error(request, "500 Internal Server Error", "fan transition failed");
+    uint32_t sequence = 0;
+    esp_err_t submit = controller_set_remote_fan_speed(speed, &sequence);
+    if (submit != ESP_OK) {
+        if (submit == ESP_ERR_NOT_ALLOWED) {
+            return send_json_error(request, "503 Service Unavailable",
+                                   "fan control is quiesced for flash maintenance");
+        }
+        fan_control_snapshot_t control;
+        if (fan_control_get_snapshot(&control) == ESP_OK && control.maintenance_active) {
+            return send_json_error(request, "503 Service Unavailable",
+                                   "fan control is quiesced for flash maintenance");
+        }
+        if (fan_control_get_snapshot(&control) == ESP_OK && control.fault_latched) {
+            return send_json_error(request, "409 Conflict",
+                                   "fan driver fault is latched until physical power cycle");
+        }
+        return send_json_error(request, "500 Internal Server Error", "fan command was not queued");
     }
-    cJSON *state = make_state_json();
-    if (state == NULL) {
-        return send_json_error(request, "500 Internal Server Error", "failed to read updated state");
+    cJSON *response = cJSON_CreateObject();
+    if (response == NULL) {
+        return ESP_ERR_NO_MEM;
     }
-    esp_err_t err = send_json(request, state);
-    cJSON_Delete(state);
+    cJSON_AddBoolToObject(response, "accepted", true);
+    cJSON_AddNumberToObject(response, "sequence", sequence);
+    cJSON_AddNumberToObject(response, "requested_speed", speed);
+    httpd_resp_set_status(request, "202 Accepted");
+    esp_err_t err = send_json(request, response);
+    cJSON_Delete(response);
     return err;
 }
 
@@ -652,6 +746,7 @@ static esp_err_t ota_failure(httpd_req_t *request, esp_err_t cause,
                              const char *message)
 {
     ota_update_abort();
+    fan_control_end_maintenance();
     s_ota_request_active = false;
     update_network_led();
     snprintf(s_last_ota_result, sizeof(s_last_ota_result), "failed: %s",
@@ -719,7 +814,7 @@ static esp_err_t ota_post_handler(httpd_req_t *request)
         received += (size_t)count;
     }
 
-    if (controller_set_remote_fan_speed(FAN_SPEED_OFF) != ESP_OK) {
+    if (fan_control_quiesce(pdMS_TO_TICKS(FAN_QUIESCE_TIMEOUT_MS)) != ESP_OK) {
         free(buffer);
         return ota_failure(request, ESP_FAIL, "failed to stop the fan safely");
     }
@@ -801,7 +896,7 @@ static esp_err_t ota_rollback_post_handler(httpd_req_t *request)
     if (network_ota_is_busy()) {
         return send_json_error(request, "409 Conflict", "a firmware update is active");
     }
-    if (controller_set_remote_fan_speed(FAN_SPEED_OFF) != ESP_OK) {
+    if (fan_control_quiesce(pdMS_TO_TICKS(FAN_QUIESCE_TIMEOUT_MS)) != ESP_OK) {
         return ota_failure(request, ESP_FAIL, "failed to stop the fan safely");
     }
     s_ota_request_active = true;
@@ -809,6 +904,7 @@ static esp_err_t ota_rollback_post_handler(httpd_req_t *request)
     esp_err_t err = ota_update_select_previous();
     if (err == ESP_ERR_NOT_FOUND) {
         s_ota_request_active = false;
+        fan_control_end_maintenance();
         update_network_led();
         return send_json_error(request, "409 Conflict", "no previous firmware is available");
     }
@@ -881,7 +977,13 @@ static esp_err_t provision_post_handler(httpd_req_t *request)
     config.sta.threshold.authmode = password_length == 0 ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
     config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
 
-    esp_err_t err = save_api_token(token_json->valuestring);
+    esp_err_t err = fan_control_quiesce(pdMS_TO_TICKS(FAN_QUIESCE_TIMEOUT_MS));
+    if (err != ESP_OK) {
+        cJSON_Delete(json);
+        return send_json_error(request, "503 Service Unavailable",
+                               "fan could not be quiesced for provisioning");
+    }
+    err = save_api_token(token_json->valuestring);
     if (err == ESP_OK) {
         err = esp_wifi_set_storage(WIFI_STORAGE_FLASH);
     }
@@ -890,6 +992,7 @@ static esp_err_t provision_post_handler(httpd_req_t *request)
     }
     cJSON_Delete(json);
     if (err != ESP_OK) {
+        fan_control_end_maintenance();
         ESP_LOGE(TAG, "failed to store provisioning data: %s", esp_err_to_name(err));
         return send_json_error(request, "500 Internal Server Error", "failed to save configuration");
     }
@@ -900,10 +1003,14 @@ static esp_err_t provision_post_handler(httpd_req_t *request)
     cJSON_AddBoolToObject(response, "restarting", true);
     err = send_json(request, response);
     cJSON_Delete(response);
-    if (err == ESP_OK &&
-        xTaskCreate(restart_task, "restart", 2048,
-                    (void *)(intptr_t)DIAGNOSTICS_RESTART_PROVISIONING, 5, NULL) != pdPASS) {
-        ESP_LOGE(TAG, "configuration saved but restart task could not be created");
+    if (err == ESP_OK) {
+        if (xTaskCreate(restart_task, "restart", 2048,
+                        (void *)(intptr_t)DIAGNOSTICS_RESTART_PROVISIONING, 5, NULL) != pdPASS) {
+            fan_control_end_maintenance();
+            ESP_LOGE(TAG, "configuration saved but restart task could not be created");
+        }
+    } else {
+        fan_control_end_maintenance();
     }
     return err;
 }

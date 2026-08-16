@@ -23,6 +23,13 @@ rest:
           - timer
           - led_brightness
           - wifi_connected
+          - desired_speed
+          - pending
+          - accepted_sequence
+          - applied_sequence
+          - control_state
+          - fault_latched
+          - maintenance_active
 
   # Read-only overnight heartbeat and reboot diagnostics. force_update makes
   # Recorder retain every poll even when the reset reason has not changed.
@@ -40,6 +47,10 @@ rest:
           - firmware_version
           - last_boot
           - runtime
+          - control_health
+          - flash_activity
+          - last_fault
+          - last_event
 
 rest_command:
   hpa300_set_speed:

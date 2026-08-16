@@ -1,6 +1,6 @@
 #include "controller.h"
 #include "diagnostics.h"
-#include "fan_select.h"
+#include "fan_control.h"
 #include "leds.h"
 #include "network.h"
 #include "ota_update.h"
@@ -13,6 +13,7 @@
 #define TAG "MAIN_APP"
 #define SETUP_SEQUENCE_TIMEOUT_MS 10000
 #define OTA_BOOT_PROBATION_MS 30000
+#define FLASH_QUIESCE_TIMEOUT_MS 250
 
 static void service_setup_sequence(uint8_t key, TickType_t now)
 {
@@ -50,8 +51,8 @@ void app_main(void)
 
     // Establish the hardware-off invariant before starting any peripheral or
     // network subsystem.
-    ESP_ERROR_CHECK(fan_init());
-    ESP_LOGI(TAG, "Fan Selector Initialized.");
+    ESP_ERROR_CHECK(fan_control_init());
+    ESP_LOGI(TAG, "Deterministic fan actor initialized OFF.");
 
     ESP_ERROR_CHECK(leds_init());
     ESP_LOGI(TAG, "LED Driver Initialized.");
@@ -84,21 +85,39 @@ void app_main(void)
         TickType_t now = xTaskGetTickCount();
         uint8_t key = touch_sens_get_key_num();
         if (key != 0 && !network_ota_is_busy()) {
-            ESP_ERROR_CHECK(controller_handle_key(key, now));
+            esp_err_t key_err = controller_handle_key(key, now);
+            if (key_err != ESP_OK && key_err != ESP_ERR_INVALID_STATE) {
+                ESP_LOGW(TAG, "Local control request failed: %s", esp_err_to_name(key_err));
+            }
             service_setup_sequence(key, now);
         }
-        ESP_ERROR_CHECK(controller_service(now));
+        esp_err_t controller_err = controller_service(now);
+        if (controller_err != ESP_OK && controller_err != ESP_ERR_TIMEOUT) {
+            ESP_LOGW(TAG, "UI service failed: %s", esp_err_to_name(controller_err));
+        }
         network_service();
         if (ota_pending &&
             (now - ota_probation_started) >= pdMS_TO_TICKS(OTA_BOOT_PROBATION_MS)) {
-            esp_err_t err = ota_update_confirm_running();
+            esp_err_t err = fan_control_quiesce(pdMS_TO_TICKS(FLASH_QUIESCE_TIMEOUT_MS));
             if (err != ESP_OK) {
-                ESP_LOGE(TAG, "Could not confirm pending OTA firmware: %s", esp_err_to_name(err));
-                diagnostics_mark_planned_restart(DIAGNOSTICS_RESTART_ROLLBACK);
-                ota_update_rollback_running();
+                // Do not write OTA metadata unless OFF was acknowledged. A
+                // healthy actor will retry after another probation interval;
+                // a hung actor will be handled by its task watchdog.
+                ESP_LOGE(TAG, "Could not quiesce fan for OTA confirmation: %s",
+                         esp_err_to_name(err));
+                ota_probation_started = now;
             } else {
-                ESP_LOGI(TAG, "OTA firmware probation passed; image marked valid");
-                ota_pending = false;
+                err = ota_update_confirm_running();
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "Could not confirm pending OTA firmware: %s",
+                             esp_err_to_name(err));
+                    diagnostics_mark_planned_restart(DIAGNOSTICS_RESTART_ROLLBACK);
+                    ota_update_rollback_running();
+                } else {
+                    fan_control_end_maintenance();
+                    ESP_LOGI(TAG, "OTA firmware probation passed; image marked valid");
+                    ota_pending = false;
+                }
             }
         }
         vTaskDelay(pdMS_TO_TICKS(20));

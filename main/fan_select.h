@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "fan_transition_core.h"
 
 typedef enum {
     FAN_SPEED_OFF,
@@ -18,8 +19,8 @@ typedef enum {
 // Function to initialize the GPIO pins for the HC238
 esp_err_t fan_init(void);
 
-esp_err_t fan_select(fan_speed_t speed);
-
-esp_err_t fan_enable(bool en);
+// Performs exactly one break-before-make transaction. On error, phase is the
+// operation that failed and a best-effort disable is attempted.
+esp_err_t fan_transition(fan_speed_t speed, fan_transition_phase_t *phase);
 
 #endif // FAN_SELECT_H

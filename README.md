@@ -94,9 +94,9 @@ The version 1 HTTP API listens on port 80:
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/v1/device` | Stable device ID, firmware/API versions, and capabilities |
-| `GET` | `/api/v1/state` | Selected fan speed, power, change source, timer, and LED state |
-| `PUT` | `/api/v1/fan` | Select fan speed with `{"speed": 0}` through `{"speed": 4}` |
+| `GET` | `/api/v1/device` | Identity, reset/runtime diagnostics, control health, and RAM-only flash counters |
+| `GET` | `/api/v1/state` | Applied/desired fan state, command sequences, timer, fault, and LED state |
+| `PUT` | `/api/v1/fan` | Queue `{"speed": 0}` through `{"speed": 4}` and return `202 Accepted` |
 | `GET` | `/api/v1/ota` | Running slot/version, maintenance state, and previous firmware |
 | `POST` | `/api/v1/ota` | Stream a signed application image into the inactive OTA slot |
 | `POST` | `/api/v1/ota/rollback` | Validate and boot the previous firmware slot |
@@ -113,7 +113,8 @@ authorization value to `secrets.yaml`, and reserve the purifier's DHCP address.
 The package also defines a read-only `sensor.hpa300_diagnostics` heartbeat. It
 polls `/api/v1/device` every 30 seconds and records every response, including
 the firmware version, `last_boot` reset details, and runtime uptime/free-heap
-watermarks, so overnight availability and reboot causes can be reviewed in
+watermarks, actor timing/counters, latest fault, and boot-scoped flash activity,
+so overnight availability and reboot causes can be reviewed in
 Home Assistant History. Remove
 `force_update: true` after active troubleshooting if the per-poll history is no
 longer useful.
@@ -135,7 +136,10 @@ reset/RTC memory only; collecting these diagnostics never writes flash during a
 power failure.
 
 Commands received through the REST API cancel any active local timed-off mode,
-so a manual timer cannot unexpectedly defeat Home Assistant control.
+so a manual timer cannot unexpectedly defeat Home Assistant control. The
+length-one command mailbox intentionally coalesces bursts: a `202` response
+means the command was accepted and assigned a sequence, while `/api/v1/state`
+reports whether that sequence was applied or superseded.
 
 ## Firmware updates
 
@@ -211,8 +215,15 @@ making the wired service connection difficult to reach.
 ## Safety model
 
 The 74HC238 provides the hardware single-active-output invariant. Firmware
-disables the decoder before changing its address and initializes fan control
-before touch or LED peripherals. The active-high E3 input is held inactive by
+disables the decoder before changing its address and initializes a statically
+allocated, high-priority fan actor before touch, LEDs, or networking. Only that
+actor calls the HC238 driver. Duplicate speed requests perform no GPIO writes,
+and obsolete pending commands are overwritten rather than replayed. A driver
+failure makes one best-effort OFF request and latches fan control across reset;
+only a cold power cycle clears the latch, and boot never replays the prior fan
+state. OTA and provisioning writes require a bounded OFF acknowledgement first.
+
+The active-high E3 input is held inactive by
 R18, a 10 kΩ hardware pull-down, so fan outputs remain disabled before the
 ESP32-S2 starts.
 

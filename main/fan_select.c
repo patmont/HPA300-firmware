@@ -15,6 +15,18 @@ _Static_assert((FAN_1 & 1) == HC238_A0_FIXED && (FAN_2 & 1) == HC238_A0_FIXED &&
                (FAN_3 & 1) == HC238_A0_FIXED && (FAN_4 & 1) == HC238_A0_FIXED,
                "fan output mapping conflicts with hard-wired A0");
 
+static esp_err_t transition_enable(void *context, bool enabled)
+{
+    (void)context;
+    return hc238_enable(enabled);
+}
+
+static esp_err_t transition_set_address(void *context, uint8_t address)
+{
+    (void)context;
+    return hc238_set_address(address);
+}
+
 esp_err_t fan_init(void)
 {
     hc238_config_t cfg = {
@@ -40,21 +52,14 @@ esp_err_t fan_init(void)
     return ESP_OK;
 }
 
-esp_err_t fan_enable(bool en)
+esp_err_t fan_transition(fan_speed_t speed, fan_transition_phase_t *phase)
 {
-    return hc238_enable(en);
-}
-
-esp_err_t fan_select(fan_speed_t speed)
-{
+    if (phase != NULL) {
+        *phase = FAN_TRANSITION_PHASE_NONE;
+    }
     if (speed < FAN_SPEED_OFF || speed >= NUM_FAN_SPEEDS) {
         ESP_LOGW(TAG, "Invalid fan speed %d", (int)speed);
         return ESP_ERR_INVALID_ARG;
-    }
-
-    if (speed == FAN_SPEED_OFF) {
-        ESP_LOGI(TAG, "Selecting FAN_OFF - disabling fan output");
-        return hc238_enable(false);
     }
 
     static const uint8_t output_map[NUM_FAN_SPEEDS] = {
@@ -65,17 +70,11 @@ esp_err_t fan_select(fan_speed_t speed)
         [FAN_SPEED_4] = FAN_4,
     };
     uint8_t out_idx = output_map[speed];
-
     ESP_LOGI(TAG, "Selecting fan %d -> HC238 output %d", (int)speed, out_idx);
-    esp_err_t err = hc238_set_output(out_idx);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    err = hc238_enable(true);
-    if (err != ESP_OK) {
-        // Best effort: a failed transition must leave the decoder disabled.
-        hc238_enable(false);
-    }
-    return err;
+    fan_transition_backend_t backend = {
+        .enable = transition_enable,
+        .set_address = transition_set_address,
+        .context = NULL,
+    };
+    return fan_transition_execute(speed == FAN_SPEED_OFF, out_idx, &backend, phase);
 }

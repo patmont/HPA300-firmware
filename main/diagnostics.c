@@ -4,9 +4,15 @@
 
 #include "esp_attr.h"
 #include "esp_log.h"
+#include "esp_spi_flash_counters.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
 
 #define TAG "DIAGNOSTICS"
 #define RESTART_MARKER_MAGIC UINT32_C(0x48504133)
+#define FAN_FAULT_MAGIC UINT32_C(0x46414e46)
+#define BREADCRUMB_MAGIC UINT32_C(0x42524352)
+#define BREADCRUMB_COUNT 16
 
 typedef struct {
     uint32_t magic;
@@ -17,6 +23,49 @@ typedef struct {
 
 static RTC_NOINIT_ATTR restart_marker_t s_restart_marker;
 static diagnostics_boot_info_t s_boot_info;
+
+typedef struct {
+    uint32_t magic;
+    uint32_t magic_inverse;
+    int32_t error;
+    uint32_t phase;
+    uint32_t checksum;
+} fan_fault_marker_t;
+
+typedef struct {
+    uint32_t commit;
+    uint32_t commit_inverse;
+    diagnostics_breadcrumb_t value;
+} breadcrumb_slot_t;
+
+typedef struct {
+    uint32_t magic;
+    uint32_t magic_inverse;
+    uint32_t next_sequence;
+    breadcrumb_slot_t slots[BREADCRUMB_COUNT];
+} breadcrumb_ring_t;
+
+static RTC_NOINIT_ATTR fan_fault_marker_t s_fan_fault;
+static RTC_NOINIT_ATTR breadcrumb_ring_t s_breadcrumbs;
+static portMUX_TYPE s_breadcrumb_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static uint32_t fan_fault_checksum(int32_t error, uint32_t phase)
+{
+    return FAN_FAULT_MAGIC ^ (uint32_t)error ^ phase ^ UINT32_C(0xa55aa55a);
+}
+
+static bool fan_fault_is_valid(void)
+{
+    return s_fan_fault.magic == FAN_FAULT_MAGIC &&
+           s_fan_fault.magic_inverse == ~FAN_FAULT_MAGIC &&
+           s_fan_fault.checksum == fan_fault_checksum(s_fan_fault.error, s_fan_fault.phase);
+}
+
+static bool breadcrumb_ring_is_valid(void)
+{
+    return s_breadcrumbs.magic == BREADCRUMB_MAGIC &&
+           s_breadcrumbs.magic_inverse == ~BREADCRUMB_MAGIC;
+}
 
 static const char *reset_reason_name(esp_reset_reason_t reason)
 {
@@ -78,6 +127,19 @@ void diagnostics_init(void)
     s_boot_info.planned_reason = planned_reason_name(
         s_boot_info.planned ? planned_reason : DIAGNOSTICS_RESTART_NONE);
 
+    // A fan driver fault intentionally survives reset-button, software,
+    // watchdog, and panic resets. Only an actual cold boot clears it.
+    if (s_boot_info.reset_reason == ESP_RST_POWERON) {
+        s_fan_fault = (fan_fault_marker_t){ 0 };
+    }
+    if (!breadcrumb_ring_is_valid() || s_boot_info.reset_reason == ESP_RST_POWERON) {
+        s_breadcrumbs = (breadcrumb_ring_t) {
+            .magic = BREADCRUMB_MAGIC,
+            .magic_inverse = ~BREADCRUMB_MAGIC,
+            .next_sequence = 1,
+        };
+    }
+
     // Consume the marker immediately. A later failure in this boot must not be
     // attributed to an old intentional restart.
     s_restart_marker = (restart_marker_t){ 0 };
@@ -87,6 +149,8 @@ void diagnostics_init(void)
              s_boot_info.planned ? "yes" : "no",
              s_boot_info.planned ? ", reason=" : "",
              s_boot_info.planned ? s_boot_info.planned_reason : "");
+    diagnostics_record_event(DIAGNOSTICS_EVENT_BOOT, (uint32_t)s_boot_info.reset_reason,
+                             fan_fault_is_valid() ? s_fan_fault.error : 0);
 }
 
 const diagnostics_boot_info_t *diagnostics_get_boot_info(void)
@@ -104,4 +168,109 @@ void diagnostics_mark_planned_restart(diagnostics_restart_t reason)
     s_restart_marker.reason_inverse = ~s_restart_marker.reason;
     s_restart_marker.magic_inverse = ~RESTART_MARKER_MAGIC;
     s_restart_marker.magic = RESTART_MARKER_MAGIC;
+}
+
+void diagnostics_record_event(diagnostics_event_t event, uint32_t value, int32_t detail)
+{
+    if (!breadcrumb_ring_is_valid()) {
+        return;
+    }
+    uint32_t uptime_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    portENTER_CRITICAL(&s_breadcrumb_lock);
+    uint32_t sequence = s_breadcrumbs.next_sequence++;
+    if (sequence == 0) {
+        sequence = 1;
+        s_breadcrumbs.next_sequence = 2;
+    }
+    breadcrumb_slot_t *slot = &s_breadcrumbs.slots[(sequence - 1U) % BREADCRUMB_COUNT];
+    slot->commit = 0;
+    slot->commit_inverse = UINT32_MAX;
+    slot->value = (diagnostics_breadcrumb_t) {
+        .sequence = sequence,
+        .event = event,
+        .uptime_ms = uptime_ms,
+        .value = value,
+        .detail = detail,
+    };
+    slot->commit_inverse = ~sequence;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    slot->commit = sequence;
+    portEXIT_CRITICAL(&s_breadcrumb_lock);
+}
+
+bool diagnostics_get_latest_event(diagnostics_breadcrumb_t *event)
+{
+    if (event == NULL) {
+        return false;
+    }
+    portENTER_CRITICAL(&s_breadcrumb_lock);
+    if (!breadcrumb_ring_is_valid() || s_breadcrumbs.next_sequence <= 1) {
+        portEXIT_CRITICAL(&s_breadcrumb_lock);
+        return false;
+    }
+    uint32_t sequence = s_breadcrumbs.next_sequence - 1U;
+    const breadcrumb_slot_t *slot = &s_breadcrumbs.slots[(sequence - 1U) % BREADCRUMB_COUNT];
+    if (slot->commit != sequence || slot->commit_inverse != ~sequence ||
+        slot->value.sequence != sequence) {
+        portEXIT_CRITICAL(&s_breadcrumb_lock);
+        return false;
+    }
+    *event = slot->value;
+    portEXIT_CRITICAL(&s_breadcrumb_lock);
+    return true;
+}
+
+const char *diagnostics_event_name(diagnostics_event_t event)
+{
+    switch (event) {
+    case DIAGNOSTICS_EVENT_BOOT: return "boot";
+    case DIAGNOSTICS_EVENT_TRANSITION_BEGIN: return "transition_begin";
+    case DIAGNOSTICS_EVENT_TRANSITION_COMMIT: return "transition_commit";
+    case DIAGNOSTICS_EVENT_TRANSITION_FAILURE: return "transition_failure";
+    case DIAGNOSTICS_EVENT_FAULT_LATCHED: return "fault_latched";
+    case DIAGNOSTICS_EVENT_MAINTENANCE_BEGIN: return "maintenance_begin";
+    case DIAGNOSTICS_EVENT_MAINTENANCE_END: return "maintenance_end";
+    default: return "unknown";
+    }
+}
+
+bool diagnostics_fan_fault_is_latched(void)
+{
+    return fan_fault_is_valid();
+}
+
+void diagnostics_latch_fan_fault(int32_t error, uint32_t phase)
+{
+    s_fan_fault.magic = 0;
+    s_fan_fault.error = error;
+    s_fan_fault.phase = phase;
+    s_fan_fault.checksum = fan_fault_checksum(error, phase);
+    s_fan_fault.magic_inverse = ~FAN_FAULT_MAGIC;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    s_fan_fault.magic = FAN_FAULT_MAGIC;
+    diagnostics_record_event(DIAGNOSTICS_EVENT_FAULT_LATCHED, phase, error);
+}
+
+void diagnostics_get_fan_fault(int32_t *error, uint32_t *phase)
+{
+    bool valid = fan_fault_is_valid();
+    if (error != NULL) {
+        *error = valid ? s_fan_fault.error : 0;
+    }
+    if (phase != NULL) {
+        *phase = valid ? s_fan_fault.phase : 0;
+    }
+}
+
+void diagnostics_get_flash_counters(diagnostics_flash_counters_t *counters)
+{
+    if (counters == NULL) {
+        return;
+    }
+    const esp_flash_counters_t *sdk = esp_flash_get_counters();
+    *counters = (diagnostics_flash_counters_t) {
+        .read = { sdk->read.count, sdk->read.bytes, sdk->read.time },
+        .write = { sdk->write.count, sdk->write.bytes, sdk->write.time },
+        .erase = { sdk->erase.count, sdk->erase.bytes, sdk->erase.time },
+    };
 }
