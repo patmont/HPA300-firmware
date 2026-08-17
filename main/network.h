@@ -18,3 +18,4 @@ void network_service(void);
 // True while flash is being written. Local controls are suppressed so the fan
 // cannot be restarted during an update.
 bool network_ota_is_busy(void);
+bool network_is_connected(void);

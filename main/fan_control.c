@@ -5,20 +5,18 @@
 
 #include "diagnostics.h"
 #include "esp_attr.h"
-#include "esp_heap_caps.h"
-#include "esp_log.h"
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "fan_policy.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "service_health.h"
 
-#define TAG "FAN_CONTROL"
 #define CONTROL_PERIOD_MS 10
 #define CONTROL_BUDGET_US 1000
 #define CONTROL_DEADLINE_US 20000
-#define CONTROL_TASK_STACK_WORDS 3072
+#define CONTROL_TASK_STACK_BYTES 3072
 #define CONTROL_TASK_PRIORITY (configMAX_PRIORITIES - 2)
 #define INIT_TIMEOUT_MS 1000
 #define EVENT_INITIALIZED BIT0
@@ -44,10 +42,7 @@ typedef struct {
     uint32_t reset_reason;
     uint32_t uptime_ms;
     fan_control_snapshot_t control;
-    diagnostics_flash_counters_t flash;
-    uint32_t free_heap_bytes;
-    uint32_t minimum_free_heap_bytes;
-    uint32_t reserved[12];
+    uint32_t reserved[20];
     uint32_t end_sequence;
 } fan_coredump_snapshot_t;
 
@@ -57,7 +52,7 @@ static uint8_t s_mailbox_storage[sizeof(fan_command_t)];
 static EventGroupHandle_t s_events;
 static StaticEventGroup_t s_event_buffer;
 static StaticTask_t s_task_buffer;
-static StackType_t s_task_stack[CONTROL_TASK_STACK_WORDS];
+static StackType_t s_task_stack[CONTROL_TASK_STACK_BYTES];
 static TaskHandle_t s_task;
 static esp_err_t s_init_result = ESP_ERR_INVALID_STATE;
 static volatile uint32_t s_snapshot_sequence;
@@ -85,20 +80,15 @@ static void publish_snapshot(const fan_control_snapshot_t *snapshot)
     s_snapshot = *snapshot;
     __atomic_store_n(&s_snapshot_sequence, sequence + 1U, __ATOMIC_RELEASE);
 
-    diagnostics_flash_counters_t flash;
-    diagnostics_get_flash_counters(&flash);
     s_coredump_snapshot.begin_sequence++;
     if ((s_coredump_snapshot.begin_sequence & 1U) == 0) {
         s_coredump_snapshot.begin_sequence++;
     }
-    s_coredump_snapshot.version = 1;
+    s_coredump_snapshot.version = 2;
     s_coredump_snapshot.size = sizeof(s_coredump_snapshot);
     s_coredump_snapshot.reset_reason = diagnostics_get_boot_info()->reset_reason;
     s_coredump_snapshot.uptime_ms = (uint32_t)(esp_timer_get_time() / 1000);
     s_coredump_snapshot.control = *snapshot;
-    s_coredump_snapshot.flash = flash;
-    s_coredump_snapshot.free_heap_bytes = esp_get_free_heap_size();
-    s_coredump_snapshot.minimum_free_heap_bytes = esp_get_minimum_free_heap_size();
     s_coredump_snapshot.end_sequence = s_coredump_snapshot.begin_sequence + 1U;
     s_coredump_snapshot.begin_sequence = s_coredump_snapshot.end_sequence;
 }
@@ -247,10 +237,12 @@ static void fan_control_task(void *argument)
     }
     state.state = state.fault_latched ? FAN_CONTROL_STATE_FAULT_LATCHED :
                                        FAN_CONTROL_STATE_READY;
+    service_health_set(SERVICE_FAN,
+        state.fault_latched ? SERVICE_STATE_FAILED : SERVICE_STATE_READY,
+        state.fault_latched ? state.fault_error : ESP_OK);
     publish_snapshot(&state);
     xEventGroupSetBits(s_events, EVENT_INITIALIZED);
     if (s_init_result != ESP_OK) {
-        ESP_LOGE(TAG, "actor initialization failed: %s", esp_err_to_name(s_init_result));
         vTaskSuspend(NULL);
     }
 
@@ -314,8 +306,6 @@ static void fan_control_task(void *argument)
                 cancel_timer(&state);
                 diagnostics_record_event(DIAGNOSTICS_EVENT_TRANSITION_FAILURE, phase, err);
                 diagnostics_latch_fan_fault(err, phase);
-                ESP_LOGE(TAG, "fan transition fault latched at %s: %s",
-                         fan_control_phase_name(phase), esp_err_to_name(err));
             }
         } else if (!state.fault_latched && state.accepted_sequence != 0 &&
                    state.applied_sequence != state.accepted_sequence) {
@@ -325,8 +315,11 @@ static void fan_control_task(void *argument)
 
         state.pending = state.desired_speed != state.applied_speed ||
                         state.accepted_sequence != state.applied_sequence;
-        state.stack_min_free_bytes =
-            (uint32_t)uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
+        if ((state.control_cycles % 100U) == 0) {
+            state.stack_min_free_bytes =
+                (uint32_t)uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
+            service_health_set_stack(SERVICE_FAN, state.stack_min_free_bytes);
+        }
         uint32_t cycle_us = (uint32_t)(esp_timer_get_time() - cycle_started_us);
         if (cycle_us > state.max_cycle_us) {
             state.max_cycle_us = cycle_us;
@@ -364,7 +357,7 @@ esp_err_t fan_control_init(void)
         .state = FAN_CONTROL_STATE_STARTING,
         .shutoff_mode = FAN_SHUTOFF_ALWAYS_ON,
     };
-    s_task = xTaskCreateStatic(fan_control_task, "fan_control", CONTROL_TASK_STACK_WORDS,
+    s_task = xTaskCreateStatic(fan_control_task, "fan_control", sizeof(s_task_stack),
                                NULL, CONTROL_TASK_PRIORITY, s_task_stack, &s_task_buffer);
     if (s_task == NULL) {
         return ESP_ERR_NO_MEM;

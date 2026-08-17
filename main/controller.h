@@ -37,6 +37,7 @@ typedef struct {
 } controller_snapshot_t;
 
 esp_err_t controller_init(void);
+void controller_set_led_available(bool available);
 esp_err_t controller_handle_key(uint8_t key, TickType_t now);
 esp_err_t controller_service(TickType_t now);
 esp_err_t controller_set_remote_fan_speed(fan_speed_t speed, uint32_t *sequence);

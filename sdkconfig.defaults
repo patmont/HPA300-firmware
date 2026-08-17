@@ -21,8 +21,8 @@ CONFIG_ESP_BROWNOUT_DET=y
 CONFIG_ESP_BROWNOUT_DET_LVL_SEL_7=y
 CONFIG_SPI_FLASH_BROWNOUT_RESET=y
 
-# Preserve the first crash in a reset cascade. Binary dumps fit the existing
-# 64 KiB coredump partition and can be decoded against the matching ELF.
+# Preserve the first crash in a reset cascade. The 4 MB layout reserves all
+# remaining 192 KiB after the OTA slots for a decodable binary dump.
 CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
 CONFIG_ESP_COREDUMP_DATA_FORMAT_BIN=y
 CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
@@ -38,6 +38,7 @@ CONFIG_SPI_FLASH_ENABLE_COUNTERS=y
 # FreeRTOS end-of-stack canary.
 CONFIG_COMPILER_STACK_CHECK_MODE_STRONG=y
 CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y
+CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
 
 # A 2 MB controller has two 960 KiB OTA slots. Optimize for size to preserve
 # at least 64 KiB of growth/metadata headroom in the signed release image.

@@ -70,7 +70,6 @@ esp_err_t fan_transition(fan_speed_t speed, fan_transition_phase_t *phase)
         [FAN_SPEED_4] = FAN_4,
     };
     uint8_t out_idx = output_map[speed];
-    ESP_LOGI(TAG, "Selecting fan %d -> HC238 output %d", (int)speed, out_idx);
     fan_transition_backend_t backend = {
         .enable = transition_enable,
         .set_address = transition_set_address,

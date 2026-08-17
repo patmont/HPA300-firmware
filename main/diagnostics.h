@@ -50,9 +50,20 @@ typedef struct {
     diagnostics_flash_counter_t erase;
 } diagnostics_flash_counters_t;
 
+typedef struct {
+    uint32_t free_heap_bytes;
+    uint32_t minimum_free_heap_bytes;
+    diagnostics_flash_counters_t flash;
+    bool coredump_present;
+    bool coredump_readable;
+    uint32_t coredump_size_bytes;
+    uint32_t coredump_capacity_bytes;
+} diagnostics_runtime_t;
+
 // Capture the reset reason before application initialization and consume any
 // planned-reset marker retained in RTC memory. This does not access flash.
 void diagnostics_init(void);
+esp_err_t diagnostics_start(void);
 
 const diagnostics_boot_info_t *diagnostics_get_boot_info(void);
 
@@ -70,3 +81,4 @@ void diagnostics_get_fan_fault(int32_t *error, uint32_t *phase);
 
 // SDK counters are maintained in RAM and add no flash operations.
 void diagnostics_get_flash_counters(diagnostics_flash_counters_t *counters);
+void diagnostics_get_runtime(diagnostics_runtime_t *runtime);

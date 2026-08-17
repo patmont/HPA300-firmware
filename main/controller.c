@@ -53,6 +53,7 @@ typedef struct {
 static controller_ui_state_t s_ui;
 static StaticSemaphore_t s_lock_buffer;
 static SemaphoreHandle_t s_lock;
+static bool s_led_available;
 
 static bool take_lock(void)
 {
@@ -62,6 +63,9 @@ static bool take_lock(void)
 
 static esp_err_t apply_network_led_locked(void)
 {
+    if (!s_led_available) {
+        return ESP_OK;
+    }
     return leds_set_led_state(NETWORK_LED, s_ui.network_led_visible);
 }
 
@@ -69,6 +73,12 @@ static esp_err_t render_status_leds_locked(const fan_control_snapshot_t *fan)
 {
     ESP_RETURN_ON_FALSE(fan->applied_speed < NUM_FAN_SPEEDS, ESP_ERR_INVALID_STATE,
                         TAG, "invalid fan speed %d", fan->applied_speed);
+    if (!s_led_available) {
+        s_ui.rendered_speed = fan->applied_speed;
+        s_ui.rendered_timer = fan->shutoff_mode;
+        s_ui.rendered_fault = fan->fault_latched;
+        return ESP_OK;
+    }
     for (int i = 0; i < NUM_LEDS; ++i) {
         ESP_RETURN_ON_ERROR(leds_set_led_state(i, false), TAG, "failed to turn off LED %d", i);
     }
@@ -89,6 +99,9 @@ static esp_err_t render_status_leds_locked(const fan_control_snapshot_t *fan)
 
 static esp_err_t apply_led_brightness_locked(led_brightness_t brightness)
 {
+    if (!s_led_available) {
+        return ESP_OK;
+    }
     return leds_set_pwm_value(s_led_brightness_duty[brightness]);
 }
 
@@ -150,11 +163,24 @@ esp_err_t controller_init(void)
         .rendered_speed = NUM_FAN_SPEEDS,
         .rendered_timer = NUM_FAN_SHUTOFF_MODES,
     };
-    ESP_RETURN_ON_ERROR(set_led_brightness_locked(LED_BRIGHTNESS_HIGH), TAG,
-                        "failed to initialize LED brightness");
+    (void)set_led_brightness_locked(LED_BRIGHTNESS_HIGH);
     fan_control_snapshot_t fan;
     ESP_RETURN_ON_ERROR(fan_control_get_snapshot(&fan), TAG, "fan actor is unavailable");
-    return render_status_leds_locked(&fan);
+    (void)render_status_leds_locked(&fan);
+    return ESP_OK;
+}
+
+void controller_set_led_available(bool available)
+{
+    s_led_available = available;
+    if (available && take_lock()) {
+        (void)apply_led_brightness_locked(s_ui.led_brightness);
+        fan_control_snapshot_t fan;
+        if (fan_control_get_snapshot(&fan) == ESP_OK) {
+            (void)render_status_leds_locked(&fan);
+        }
+        xSemaphoreGive(s_lock);
+    }
 }
 
 esp_err_t controller_handle_key(uint8_t key, TickType_t now)

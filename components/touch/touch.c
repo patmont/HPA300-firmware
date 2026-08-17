@@ -33,6 +33,28 @@ static touch_sensor_handle_t s_sensor_handle;
 static touch_channel_handle_t s_channel_handle[NUM_KEYS];
 static QueueHandle_t s_key_event_queue;
 
+static void cleanup_touch(void)
+{
+    if (s_sensor_handle != NULL) {
+        (void)touch_sensor_stop_continuous_scanning(s_sensor_handle);
+        (void)touch_sensor_disable(s_sensor_handle);
+    }
+    if (s_key_event_queue != NULL) {
+        vQueueDelete(s_key_event_queue);
+        s_key_event_queue = NULL;
+    }
+    for (int i = NUM_KEYS - 1; i >= 0; --i) {
+        if (s_channel_handle[i] != NULL) {
+            (void)touch_sensor_del_channel(s_channel_handle[i]);
+            s_channel_handle[i] = NULL;
+        }
+    }
+    if (s_sensor_handle != NULL) {
+        (void)touch_sensor_del_controller(s_sensor_handle);
+        s_sensor_handle = NULL;
+    }
+}
+
 static bool on_active(touch_sensor_handle_t sens_handle,
                       const touch_active_event_data_t *event,
                       void *user_ctx)
@@ -101,43 +123,68 @@ esp_err_t touch_sens_init(void)
     /* Step 1: Create a touch sensor controller handle */
     touch_sensor_sample_config_t sample_cfg[TOUCH_SAMPLE_CFG_NUM] = TOUCH_SAMPLE_CFG_DEFAULT();
     touch_sensor_config_t sens_cfg = TOUCH_SENSOR_DEFAULT_BASIC_CONFIG(TOUCH_SAMPLE_CFG_NUM, sample_cfg);
-    ESP_RETURN_ON_ERROR(touch_sensor_new_controller(&sens_cfg, &s_sensor_handle), TAG,
-                        "failed to create touch controller");
+    esp_err_t err = touch_sensor_new_controller(&sens_cfg, &s_sensor_handle);
+    if (err != ESP_OK) {
+        cleanup_touch();
+        return err;
+    }
 
     /* Step 2: Create and enable the new touch channel handles */
     touch_channel_config_t chan_cfg = TOUCH_CHAN_CFG_DEFAULT();
     /* Allocate new touch channel on the touch controller */
     for (int i = 0; i < NUM_KEYS; i++) {
-        ESP_RETURN_ON_ERROR(touch_sensor_new_channel(s_sensor_handle, s_channel_id[i], &chan_cfg,
-                                                     &s_channel_handle[i]),
-                            TAG, "failed to create touch channel %d", (int)s_channel_id[i]);
+        err = touch_sensor_new_channel(s_sensor_handle, s_channel_id[i], &chan_cfg,
+                                       &s_channel_handle[i]);
+        if (err != ESP_OK) {
+            cleanup_touch();
+            return err;
+        }
     }
 
     /* Step 3: Configure the default filter for the touch sensor */
     touch_sensor_filter_config_t filter_cfg = TOUCH_SENSOR_DEFAULT_FILTER_CONFIG();
-    ESP_RETURN_ON_ERROR(touch_sensor_config_filter(s_sensor_handle, &filter_cfg), TAG,
-                        "failed to configure touch filter");
+    err = touch_sensor_config_filter(s_sensor_handle, &filter_cfg);
+    if (err != ESP_OK) {
+        cleanup_touch();
+        return err;
+    }
 
     /* Step 4: Do the initial scanning to initialize the channel data */
-    ESP_RETURN_ON_ERROR(do_initial_scanning(s_sensor_handle, s_channel_handle), TAG,
-                        "touch calibration failed");
+    err = do_initial_scanning(s_sensor_handle, s_channel_handle);
+    if (err != ESP_OK) {
+        cleanup_touch();
+        return err;
+    }
 
     s_key_event_queue = xQueueCreate(KEY_EVENT_QUEUE_LENGTH, sizeof(uint8_t));
-    ESP_RETURN_ON_FALSE(s_key_event_queue != NULL, ESP_ERR_NO_MEM, TAG, "failed to create key event queue");
+    if (s_key_event_queue == NULL) {
+        cleanup_touch();
+        return ESP_ERR_NO_MEM;
+    }
 
     /* Step 5: Register the event callbacks for the touch sensor */
     touch_event_callbacks_t callbacks = {
         .on_active = on_active,
     };
-    ESP_RETURN_ON_ERROR(touch_sensor_register_callbacks(s_sensor_handle, &callbacks, NULL), TAG,
-                        "failed to register touch callbacks");
+    err = touch_sensor_register_callbacks(s_sensor_handle, &callbacks, NULL);
+    if (err != ESP_OK) {
+        cleanup_touch();
+        return err;
+    }
 
     /* Step 6: Enable the touch sensor */
-    ESP_RETURN_ON_ERROR(touch_sensor_enable(s_sensor_handle), TAG, "failed to enable touch sensor");
+    err = touch_sensor_enable(s_sensor_handle);
+    if (err != ESP_OK) {
+        cleanup_touch();
+        return err;
+    }
 
     /* Step 7: Start continuous scanning */
-    ESP_RETURN_ON_ERROR(touch_sensor_start_continuous_scanning(s_sensor_handle), TAG,
-                        "failed to start touch scanning");
+    err = touch_sensor_start_continuous_scanning(s_sensor_handle);
+    if (err != ESP_OK) {
+        cleanup_touch();
+        return err;
+    }
     return ESP_OK;
 }
 

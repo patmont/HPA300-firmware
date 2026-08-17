@@ -9,6 +9,8 @@
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "sdkconfig.h"
 
 #define TAG "OTA_UPDATE"
@@ -55,6 +57,26 @@ static void copy_app_field(char *destination, size_t destination_size,
     destination[length] = '\0';
 }
 
+static esp_err_t erase_inactive_partition(const esp_partition_t *partition)
+{
+    ESP_RETURN_ON_FALSE(partition != NULL && partition->erase_size != 0,
+                        ESP_ERR_INVALID_ARG, TAG, "invalid OTA partition");
+    ESP_RETURN_ON_FALSE(partition->size % partition->erase_size == 0,
+                        ESP_ERR_INVALID_SIZE, TAG, "OTA partition is not erase aligned");
+
+    // A bulk erase of the 1.875 MiB slot can exceed the five-second task watchdog
+    // window while the HTTP server task is active. Erase one hardware sector at a
+    // time and block for one scheduler tick so the idle task and fan actor run.
+    for (size_t offset = 0; offset < partition->size; offset += partition->erase_size) {
+        esp_err_t err = esp_partition_erase_range(partition, offset, partition->erase_size);
+        if (err != ESP_OK) {
+            return err;
+        }
+        vTaskDelay(1);
+    }
+    return ESP_OK;
+}
+
 esp_err_t ota_update_begin(const uint8_t *image_header, size_t header_length,
                            size_t image_size, char *version, size_t version_size)
 {
@@ -97,8 +119,18 @@ esp_err_t ota_update_begin(const uint8_t *image_header, size_t header_length,
     // declared upload length. A Secure Boot v2 signature occupies a sector
     // after the unsigned image. If a shorter/unsigned upload has the same
     // payload as a previously signed image, leaving that sector untouched
-    // would allow the stale signature to validate the new upload.
-    esp_err_t err = esp_ota_begin(s_target, OTA_SIZE_UNKNOWN, &s_handle);
+    // would allow the stale signature to validate the new upload. Do it in
+    // bounded operations rather than OTA_SIZE_UNKNOWN, which blocks while
+    // erasing the complete partition and can trip the task watchdog.
+    esp_err_t err = erase_inactive_partition(s_target);
+    if (err != ESP_OK) {
+        s_target = NULL;
+        return err;
+    }
+    // esp_ota_begin() must still establish its normal rollback protections.
+    // Request just one sector: the full slot was already erased above, and a
+    // one-sector erase is bounded unlike an image-sized or unknown-size erase.
+    err = esp_ota_begin(s_target, s_target->erase_size, &s_handle);
     if (err != ESP_OK) {
         s_target = NULL;
         return err;

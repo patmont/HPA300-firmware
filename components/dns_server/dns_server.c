@@ -2,12 +2,12 @@
 
 #include <errno.h>
 #include <stdbool.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 #include "freertos/task.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
@@ -15,6 +15,10 @@
 #define TAG "CAPTIVE_DNS"
 #define DNS_PORT 53
 #define DNS_PACKET_MAX 256
+#define DNS_TASK_STACK_BYTES 3072
+#define DNS_EVENT_STARTED BIT0
+#define DNS_EVENT_STOPPED BIT1
+#define DNS_EVENT_FAILED BIT2
 
 typedef struct __attribute__((packed)) {
     uint16_t id;
@@ -37,9 +41,17 @@ typedef struct __attribute__((packed)) {
 struct dns_server {
     volatile bool running;
     volatile TaskHandle_t task;
+    bool in_use;
     int socket_fd;
     const char *netif_key;
+    StaticTask_t task_buffer;
+    StackType_t task_stack[DNS_TASK_STACK_BYTES];
+    StaticEventGroup_t event_buffer;
+    EventGroupHandle_t events;
 };
+
+static struct dns_server s_server;
+static portMUX_TYPE s_server_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static size_t question_end_offset(const uint8_t *packet, size_t length)
 {
@@ -118,11 +130,17 @@ static void dns_task(void *arg)
         server->socket_fd = -1;
         server->running = false;
         server->task = NULL;
+        xEventGroupSetBits(server->events, DNS_EVENT_FAILED | DNS_EVENT_STOPPED);
         vTaskDelete(NULL);
         return;
     }
 
+    struct timeval receive_timeout = { .tv_sec = 0, .tv_usec = 250000 };
+    (void)setsockopt(server->socket_fd, SOL_SOCKET, SO_RCVTIMEO,
+                     &receive_timeout, sizeof(receive_timeout));
+
     ESP_LOGI(TAG, "captive DNS server started");
+    xEventGroupSetBits(server->events, DNS_EVENT_STARTED);
     while (server->running) {
         uint8_t packet[DNS_PACKET_MAX];
         struct sockaddr_storage source;
@@ -152,6 +170,7 @@ static void dns_task(void *arg)
         server->socket_fd = -1;
     }
     server->task = NULL;
+    xEventGroupSetBits(server->events, DNS_EVENT_STOPPED);
     vTaskDelete(NULL);
 }
 
@@ -161,16 +180,31 @@ dns_server_handle_t dns_server_start(const char *netif_key)
         return NULL;
     }
 
-    dns_server_handle_t server = calloc(1, sizeof(*server));
-    if (server == NULL) {
+    portENTER_CRITICAL(&s_server_lock);
+    if (s_server.in_use) {
+        portEXIT_CRITICAL(&s_server_lock);
         return NULL;
     }
+    memset(&s_server, 0, sizeof(s_server));
+    s_server.in_use = true;
+    portEXIT_CRITICAL(&s_server_lock);
+    dns_server_handle_t server = &s_server;
     server->running = true;
     server->socket_fd = -1;
     server->netif_key = netif_key;
-    if (xTaskCreate(dns_task, "captive_dns", 3072, server, 5,
-                    (TaskHandle_t *)&server->task) != pdPASS) {
-        free(server);
+    server->events = xEventGroupCreateStatic(&server->event_buffer);
+    server->task = xTaskCreateStatic(dns_task, "captive_dns", sizeof(server->task_stack),
+                                     server, 5, server->task_stack, &server->task_buffer);
+    if (server->task == NULL || server->events == NULL) {
+        server->in_use = false;
+        return NULL;
+    }
+    EventBits_t bits = xEventGroupWaitBits(server->events,
+        DNS_EVENT_STARTED | DNS_EVENT_FAILED, pdFALSE, pdFALSE, pdMS_TO_TICKS(1000));
+    if (!(bits & DNS_EVENT_STARTED)) {
+        (void)xEventGroupWaitBits(server->events, DNS_EVENT_STOPPED, pdFALSE, pdTRUE,
+                                  pdMS_TO_TICKS(1000));
+        server->in_use = false;
         return NULL;
     }
     return server;
@@ -185,12 +219,13 @@ void dns_server_stop(dns_server_handle_t server)
     if (server->socket_fd >= 0) {
         shutdown(server->socket_fd, SHUT_RDWR);
     }
-    for (int i = 0; i < 20 && server->task != NULL; i++) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-    if (server->task != NULL) {
-        ESP_LOGW(TAG, "DNS task did not stop promptly; leaving its handle allocated");
+    EventBits_t bits = xEventGroupWaitBits(server->events, DNS_EVENT_STOPPED,
+                                           pdFALSE, pdTRUE, pdMS_TO_TICKS(1000));
+    if (!(bits & DNS_EVENT_STOPPED)) {
+        ESP_LOGW(TAG, "DNS task stop is pending; ownership retained for retry");
         return;
     }
-    free(server);
+    portENTER_CRITICAL(&s_server_lock);
+    server->in_use = false;
+    portEXIT_CRITICAL(&s_server_lock);
 }

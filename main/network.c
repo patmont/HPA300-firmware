@@ -22,11 +22,14 @@
 #include "esp_wifi.h"
 #include "esp_wifi_ap_get_sta_list.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "lwip/sockets.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "ota_update.h"
+#include "ota_worker.h"
+#include "service_health.h"
 
 #define TAG "NETWORK"
 #define SETTINGS_NAMESPACE "hpa300"
@@ -36,9 +39,10 @@
 #define WIFI_RETRY_LIMIT 5
 #define REQUEST_BODY_MAX 512
 #define OTA_MAINTENANCE_WINDOW_MS (10 * 60 * 1000)
-#define OTA_RECEIVE_BUFFER_SIZE 4096
 #define OTA_PREFLIGHT_BUFFER_SIZE 512
+#define HTTP_SERVER_STACK_SIZE 8192
 #define FAN_QUIESCE_TIMEOUT_MS 250
+#define NETWORK_EVENT_QUEUE_LENGTH 8
 
 extern const char provision_html_start[] asm("_binary_provision_html_start");
 extern const char provision_html_end[] asm("_binary_provision_html_end");
@@ -51,6 +55,13 @@ static esp_netif_t *s_sta_netif;
 static esp_netif_t *s_ap_netif;
 static bool s_wifi_started;
 static bool s_http_ready;
+static bool s_netif_initialized;
+static bool s_event_loop_initialized;
+static bool s_wifi_initialized;
+static bool s_wifi_handler_registered;
+static bool s_ip_handler_registered;
+static bool s_http_start_attempted;
+static bool s_dns_start_attempted;
 static bool s_has_wifi_credentials;
 static bool s_connected;
 static bool s_provisioning;
@@ -60,10 +71,23 @@ static bool s_maintenance_active;
 static bool s_maintenance_keep_ap;
 static volatile bool s_ota_request_active;
 static TickType_t s_maintenance_started;
+static TickType_t s_reconnect_at;
 static unsigned s_retry_count;
 static char s_api_token[API_TOKEN_MAX_LENGTH + 1];
 static char s_captive_portal_uri[32];
 static char s_last_ota_result[96];
+typedef enum {
+    MANAGER_EVENT_STA_START,
+    MANAGER_EVENT_STA_DISCONNECTED,
+    MANAGER_EVENT_GOT_IP,
+} manager_event_type_t;
+typedef struct {
+    manager_event_type_t type;
+    esp_ip4_addr_t address;
+} manager_event_t;
+static StaticQueue_t s_manager_queue_buffer;
+static uint8_t s_manager_queue_storage[NETWORK_EVENT_QUEUE_LENGTH * sizeof(manager_event_t)];
+static QueueHandle_t s_manager_queue;
 
 static esp_err_t provisioning_enable(bool forced);
 static void maintenance_close(bool preserve_ap);
@@ -193,6 +217,10 @@ static esp_err_t provisioning_enable(bool forced)
     s_provisioning_forced = forced;
     if (s_wifi_started) {
         configure_captive_portal_dhcp();
+        if (s_dns_start_attempted) {
+            service_health_note_restart(SERVICE_DNS);
+        }
+        s_dns_start_attempted = true;
         s_dns_server = dns_server_start("WIFI_AP_DEF");
         ESP_RETURN_ON_FALSE(s_dns_server != NULL, ESP_ERR_NO_MEM, TAG,
                             "failed to start captive DNS");
@@ -236,10 +264,49 @@ static void maintenance_close(bool preserve_ap)
 
 void network_service(void)
 {
+    manager_event_t event;
+    while (s_manager_queue != NULL && xQueueReceive(s_manager_queue, &event, 0) == pdTRUE) {
+        if (event.type == MANAGER_EVENT_STA_START) {
+            update_network_led();
+            if (s_has_wifi_credentials) {
+                (void)esp_wifi_connect();
+            }
+        } else if (event.type == MANAGER_EVENT_STA_DISCONNECTED) {
+            s_connected = false;
+            service_health_set(SERVICE_NETWORK, SERVICE_STATE_DEGRADED,
+                               ESP_ERR_WIFI_NOT_CONNECT);
+            update_network_led();
+            if (s_has_wifi_credentials && s_retry_count < WIFI_RETRY_LIMIT) {
+                s_retry_count++;
+                (void)esp_wifi_connect();
+                ESP_LOGW(TAG, "Wi-Fi reconnect attempt %u/%u", s_retry_count,
+                         WIFI_RETRY_LIMIT);
+            } else if (s_has_wifi_credentials && !s_reconnect_pending) {
+                s_retry_count = 0;
+                s_reconnect_pending = true;
+                service_health_note_restart(SERVICE_NETWORK);
+                s_reconnect_at = xTaskGetTickCount() + pdMS_TO_TICKS(30000);
+                ESP_LOGW(TAG, "Wi-Fi unavailable; retrying in 30 seconds");
+            }
+        } else if (event.type == MANAGER_EVENT_GOT_IP) {
+            s_connected = true;
+            s_retry_count = 0;
+            service_health_set(SERVICE_NETWORK, SERVICE_STATE_READY, ESP_OK);
+            ESP_LOGI(TAG, "Wi-Fi connected, address " IPSTR, IP2STR(&event.address));
+            provisioning_disable();
+            update_network_led();
+        }
+    }
+    TickType_t now = xTaskGetTickCount();
+    if (s_reconnect_pending && (int32_t)(now - s_reconnect_at) >= 0) {
+        s_reconnect_pending = false;
+        if (!s_connected && s_has_wifi_credentials) {
+            (void)esp_wifi_connect();
+        }
+    }
     if (!s_maintenance_active || network_ota_is_busy()) {
         return;
     }
-    TickType_t now = xTaskGetTickCount();
     if ((now - s_maintenance_started) >= pdMS_TO_TICKS(OTA_MAINTENANCE_WINDOW_MS)) {
         maintenance_close(false);
     }
@@ -247,56 +314,34 @@ void network_service(void)
 
 bool network_ota_is_busy(void)
 {
-    return s_ota_request_active || ota_update_is_busy();
+    return s_ota_request_active || ota_worker_is_busy();
 }
 
-static void reconnect_task(void *arg)
+bool network_is_connected(void)
 {
-    (void)arg;
-    vTaskDelay(pdMS_TO_TICKS(30000));
-    s_reconnect_pending = false;
-    if (!s_connected && s_has_wifi_credentials) {
-        esp_wifi_connect();
-    }
-    vTaskDelete(NULL);
+    return s_connected;
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t event_id,
                                void *event_data)
 {
     (void)arg;
-    (void)event_data;
+    manager_event_t event;
     if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        update_network_led();
-        if (s_has_wifi_credentials) {
-            esp_wifi_connect();
-        }
+        event = (manager_event_t) { .type = MANAGER_EVENT_STA_START };
     } else if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        s_connected = false;
-        update_network_led();
-        if (!s_has_wifi_credentials) {
-            return;
-        }
-        if (s_retry_count < WIFI_RETRY_LIMIT) {
-            s_retry_count++;
-            esp_wifi_connect();
-            ESP_LOGW(TAG, "Wi-Fi reconnect attempt %u/%u", s_retry_count, WIFI_RETRY_LIMIT);
-        } else if (!s_reconnect_pending) {
-            s_retry_count = 0;
-            s_reconnect_pending = true;
-            ESP_LOGW(TAG, "Wi-Fi unavailable; retrying in 30 seconds (setup requires the physical gesture)");
-            if (xTaskCreate(reconnect_task, "wifi_reconnect", 2048, NULL, 4, NULL) != pdPASS) {
-                s_reconnect_pending = false;
-                ESP_LOGE(TAG, "failed to schedule Wi-Fi reconnect");
-            }
-        }
+        event = (manager_event_t) { .type = MANAGER_EVENT_STA_DISCONNECTED };
     } else if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        const ip_event_got_ip_t *event = event_data;
-        s_connected = true;
-        s_retry_count = 0;
-        ESP_LOGI(TAG, "Wi-Fi connected, address " IPSTR, IP2STR(&event->ip_info.ip));
-        provisioning_disable();
-        update_network_led();
+        const ip_event_got_ip_t *got_ip = event_data;
+        event = (manager_event_t) {
+            .type = MANAGER_EVENT_GOT_IP,
+            .address = got_ip->ip_info.ip,
+        };
+    } else {
+        return;
+    }
+    if (s_manager_queue != NULL && xQueueSend(s_manager_queue, &event, 0) != pdTRUE) {
+        service_health_set(SERVICE_NETWORK, SERVICE_STATE_DEGRADED, ESP_ERR_TIMEOUT);
     }
 }
 
@@ -329,6 +374,8 @@ static esp_err_t send_json_error(httpd_req_t *request, const char *status,
 
 static void add_boot_diagnostics(cJSON *json)
 {
+    service_health_set_stack(SERVICE_HTTP,
+        (uint32_t)uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t));
     const diagnostics_boot_info_t *boot = diagnostics_get_boot_info();
     cJSON *reset = cJSON_AddObjectToObject(json, "last_boot");
     if (reset == NULL) {
@@ -348,9 +395,16 @@ static void add_boot_diagnostics(cJSON *json)
     }
     cJSON_AddNumberToObject(runtime, "uptime_seconds",
                             (double)(esp_timer_get_time() / UINT64_C(1000000)));
-    cJSON_AddNumberToObject(runtime, "free_heap_bytes", esp_get_free_heap_size());
+    diagnostics_runtime_t diagnostics;
+    diagnostics_get_runtime(&diagnostics);
+    cJSON_AddNumberToObject(runtime, "free_heap_bytes", diagnostics.free_heap_bytes);
     cJSON_AddNumberToObject(runtime, "minimum_free_heap_bytes",
-                            esp_get_minimum_free_heap_size());
+                            diagnostics.minimum_free_heap_bytes);
+    cJSON_AddBoolToObject(runtime, "coredump_present", diagnostics.coredump_present);
+    cJSON_AddBoolToObject(runtime, "coredump_readable", diagnostics.coredump_readable);
+    cJSON_AddNumberToObject(runtime, "coredump_size_bytes", diagnostics.coredump_size_bytes);
+    cJSON_AddNumberToObject(runtime, "coredump_capacity_bytes",
+                            diagnostics.coredump_capacity_bytes);
 
     fan_control_snapshot_t control;
     if (fan_control_get_snapshot(&control) == ESP_OK) {
@@ -415,6 +469,25 @@ static void add_boot_diagnostics(cJSON *json)
             cJSON_AddNumberToObject(event, "uptime_ms", latest.uptime_ms);
             cJSON_AddNumberToObject(event, "value", latest.value);
             cJSON_AddNumberToObject(event, "detail", latest.detail);
+        }
+    }
+
+    cJSON *services = cJSON_AddObjectToObject(json, "service_health");
+    if (services != NULL) {
+        for (service_id_t id = 0; id < SERVICE_COUNT; ++id) {
+            service_health_snapshot_t snapshot;
+            if (!service_health_get(id, &snapshot)) {
+                continue;
+            }
+            cJSON *service = cJSON_AddObjectToObject(services, service_health_name(id));
+            if (service != NULL) {
+                cJSON_AddStringToObject(service, "state",
+                                        service_health_state_name(snapshot.state));
+                cJSON_AddNumberToObject(service, "last_error", snapshot.last_error);
+                cJSON_AddNumberToObject(service, "restart_count", snapshot.restart_count);
+                cJSON_AddNumberToObject(service, "minimum_free_stack_bytes",
+                                        snapshot.minimum_free_stack_bytes);
+            }
         }
     }
 }
@@ -712,7 +785,8 @@ static esp_err_t ota_status_get_handler(httpd_req_t *request)
         return access;
     }
     ota_update_info_t info;
-    if (ota_update_get_info(&info) != ESP_OK) {
+    ota_previous_validation_t validation;
+    if (ota_worker_get_info(&info, &validation) != ESP_OK) {
         return send_json_error(request, "500 Internal Server Error",
                                "failed to read OTA partitions");
     }
@@ -729,6 +803,8 @@ static esp_err_t ota_status_get_handler(httpd_req_t *request)
     cJSON_AddBoolToObject(json, "maintenance_active", s_maintenance_active);
     cJSON_AddBoolToObject(json, "busy", network_ota_is_busy());
     cJSON_AddBoolToObject(json, "previous_available", info.previous_available);
+    cJSON_AddStringToObject(json, "previous_validation",
+                            ota_worker_validation_name(validation));
     if (info.previous_available) {
         cJSON_AddStringToObject(json, "previous_version", info.previous_version);
         cJSON_AddStringToObject(json, "previous_slot", info.previous_slot);
@@ -745,7 +821,7 @@ static esp_err_t ota_status_get_handler(httpd_req_t *request)
 static esp_err_t ota_failure(httpd_req_t *request, esp_err_t cause,
                              const char *message)
 {
-    ota_update_abort();
+    ota_worker_abort();
     fan_control_end_maintenance();
     s_ota_request_active = false;
     update_network_led();
@@ -791,21 +867,23 @@ static esp_err_t ota_post_handler(httpd_req_t *request)
     // slow AP upload that began in time must not have its interface disabled.
     s_ota_request_active = true;
 
-    uint8_t *buffer = malloc(OTA_RECEIVE_BUFFER_SIZE);
-    if (buffer == NULL) {
-        s_ota_request_active = false;
-        return send_json_error(request, "500 Internal Server Error", "OTA buffer allocation failed");
-    }
     size_t expected = (size_t)request->content_len;
     size_t preflight_length = expected < OTA_PREFLIGHT_BUFFER_SIZE
                                   ? expected
                                   : OTA_PREFLIGHT_BUFFER_SIZE;
+    size_t capacity = 0;
+    uint8_t *buffer = ota_worker_acquire_buffer(pdMS_TO_TICKS(1000), &capacity);
+    if (buffer == NULL || capacity < preflight_length) {
+        s_ota_request_active = false;
+        return send_json_error(request, "503 Service Unavailable",
+                               "OTA worker buffers are busy; retry shortly");
+    }
     size_t received = 0;
     while (received < preflight_length) {
         int count = httpd_req_recv(request, (char *)buffer + received,
                                    preflight_length - received);
         if (count <= 0) {
-            free(buffer);
+            ota_worker_release_buffer(buffer);
             esp_err_t response =
                 ota_failure(request, ESP_FAIL, "firmware upload was interrupted");
             close_upload_session(request);
@@ -814,37 +892,34 @@ static esp_err_t ota_post_handler(httpd_req_t *request)
         received += (size_t)count;
     }
 
-    if (fan_control_quiesce(pdMS_TO_TICKS(FAN_QUIESCE_TIMEOUT_MS)) != ESP_OK) {
-        free(buffer);
-        return ota_failure(request, ESP_FAIL, "failed to stop the fan safely");
-    }
     controller_set_network_status(CONTROLLER_NETWORK_UPDATING);
 
-    char new_version[sizeof(((esp_app_desc_t *)0)->version)];
-    esp_err_t err = ota_update_begin(buffer, received, expected,
-                                     new_version, sizeof(new_version));
+    esp_err_t err = ota_worker_begin_and_write(buffer, received, expected);
     if (err != ESP_OK) {
-        free(buffer);
         esp_err_t response = ota_failure(request, err, "firmware header is invalid");
         close_upload_session(request);
         return response;
     }
-    err = ota_update_write(buffer, received);
     size_t total = received;
     while (err == ESP_OK && total < expected) {
+        buffer = ota_worker_acquire_buffer(pdMS_TO_TICKS(1000), &capacity);
+        if (buffer == NULL) {
+            err = ESP_ERR_TIMEOUT;
+            break;
+        }
         size_t wanted = expected - total;
-        if (wanted > OTA_RECEIVE_BUFFER_SIZE) {
-            wanted = OTA_RECEIVE_BUFFER_SIZE;
+        if (wanted > capacity) {
+            wanted = capacity;
         }
         int count = httpd_req_recv(request, (char *)buffer, wanted);
         if (count <= 0) {
+            ota_worker_release_buffer(buffer);
             err = ESP_FAIL;
             break;
         }
-        err = ota_update_write(buffer, (size_t)count);
+        err = ota_worker_write(buffer, (size_t)count);
         total += (size_t)count;
     }
-    free(buffer);
     if (err != ESP_OK) {
         bool incomplete = total < expected;
         esp_err_t response = ota_failure(request, err, incomplete
@@ -856,24 +931,14 @@ static esp_err_t ota_post_handler(httpd_req_t *request)
         return response;
     }
 
-    err = ota_update_finish();
+    err = ota_worker_finish();
     if (err != ESP_OK) {
         return ota_failure(request, err, "firmware image or signature is invalid");
     }
 
     const esp_app_desc_t *running = esp_app_get_description();
+    const char *new_version = ota_worker_new_version();
     snprintf(s_last_ota_result, sizeof(s_last_ota_result), "installed %s", new_version);
-    maintenance_close(true);
-    bool restarting =
-        xTaskCreate(restart_task, "ota_restart", 2048,
-                    (void *)(intptr_t)DIAGNOSTICS_RESTART_OTA, 5, NULL) == pdPASS;
-    if (!restarting) {
-        s_ota_request_active = false;
-        update_network_led();
-        strlcpy(s_last_ota_result, "installed; manual restart required",
-                sizeof(s_last_ota_result));
-        ESP_LOGE(TAG, "firmware installed but restart task could not be created");
-    }
     cJSON *json = cJSON_CreateObject();
     if (json == NULL) {
         return ESP_ERR_NO_MEM;
@@ -881,9 +946,22 @@ static esp_err_t ota_post_handler(httpd_req_t *request)
     cJSON_AddBoolToObject(json, "accepted", true);
     cJSON_AddStringToObject(json, "from_version", running->version);
     cJSON_AddStringToObject(json, "to_version", new_version);
-    cJSON_AddBoolToObject(json, "restarting", restarting);
+    cJSON_AddBoolToObject(json, "restarting", true);
     esp_err_t response_err = send_json(request, json);
     cJSON_Delete(json);
+    // Flush the successful response before the delayed planned reboot is
+    // scheduled. This keeps a browser disconnect from obscuring acceptance.
+    maintenance_close(true);
+    bool restarting =
+        xTaskCreate(restart_task, "ota_restart", 2048,
+                    (void *)(intptr_t)DIAGNOSTICS_RESTART_OTA, 5, NULL) == pdPASS;
+    if (!restarting) {
+        s_ota_request_active = false;
+        strlcpy(s_last_ota_result, "installed; manual restart required",
+                sizeof(s_last_ota_result));
+        service_health_set(SERVICE_OTA_WORKER, SERVICE_STATE_DEGRADED, ESP_ERR_NO_MEM);
+        ESP_LOGE(TAG, "firmware installed but restart task could not be created");
+    }
     return response_err;
 }
 
@@ -896,12 +974,14 @@ static esp_err_t ota_rollback_post_handler(httpd_req_t *request)
     if (network_ota_is_busy()) {
         return send_json_error(request, "409 Conflict", "a firmware update is active");
     }
-    if (fan_control_quiesce(pdMS_TO_TICKS(FAN_QUIESCE_TIMEOUT_MS)) != ESP_OK) {
-        return ota_failure(request, ESP_FAIL, "failed to stop the fan safely");
-    }
     s_ota_request_active = true;
     controller_set_network_status(CONTROLLER_NETWORK_UPDATING);
-    esp_err_t err = ota_update_select_previous();
+    esp_err_t err = ota_worker_select_previous();
+    if (err == ESP_ERR_NOT_FINISHED) {
+        s_ota_request_active = false;
+        return send_json_error(request, "503 Service Unavailable",
+                               "previous firmware validation is pending; retry shortly");
+    }
     if (err == ESP_ERR_NOT_FOUND) {
         s_ota_request_active = false;
         fan_control_end_maintenance();
@@ -912,23 +992,23 @@ static esp_err_t ota_rollback_post_handler(httpd_req_t *request)
         return ota_failure(request, err, "previous firmware failed validation");
     }
 
+    cJSON *json = cJSON_CreateObject();
+    if (json == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddBoolToObject(json, "accepted", true);
+    cJSON_AddBoolToObject(json, "restarting", true);
+    esp_err_t response_err = send_json(request, json);
+    cJSON_Delete(json);
     maintenance_close(true);
     bool restarting =
         xTaskCreate(restart_task, "rollback_restart", 2048,
                     (void *)(intptr_t)DIAGNOSTICS_RESTART_ROLLBACK, 5, NULL) == pdPASS;
     if (!restarting) {
         s_ota_request_active = false;
-        update_network_led();
+        service_health_set(SERVICE_OTA_WORKER, SERVICE_STATE_DEGRADED, ESP_ERR_NO_MEM);
         ESP_LOGE(TAG, "previous firmware selected but restart task could not be created");
     }
-    cJSON *json = cJSON_CreateObject();
-    if (json == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-    cJSON_AddBoolToObject(json, "accepted", true);
-    cJSON_AddBoolToObject(json, "restarting", restarting);
-    esp_err_t response_err = send_json(request, json);
-    cJSON_Delete(json);
     return response_err;
 }
 
@@ -1028,10 +1108,21 @@ static esp_err_t not_found_handler(httpd_req_t *request, httpd_err_code_t error)
 
 static esp_err_t start_http_server(void)
 {
+    if (s_http_start_attempted) {
+        service_health_note_restart(SERVICE_HTTP);
+    }
+    s_http_start_attempted = true;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    // Validation and flash work live on the OTA worker. Keep 8 KiB here as
+    // defense in depth for HTTP parsing, authentication, and JSON rendering.
+    config.stack_size = HTTP_SERVER_STACK_SIZE;
     config.lru_purge_enable = true;
     config.max_uri_handlers = 16;
-    ESP_RETURN_ON_ERROR(httpd_start(&s_http_server, &config), TAG, "failed to start HTTP server");
+    esp_err_t err = httpd_start(&s_http_server, &config);
+    if (err != ESP_OK) {
+        service_health_set(SERVICE_HTTP, SERVICE_STATE_DEGRADED, err);
+        return err;
+    }
 
     const httpd_uri_t handlers[] = {
         { .uri = "/", .method = HTTP_GET, .handler = root_get_handler },
@@ -1049,13 +1140,23 @@ static esp_err_t start_http_server(void)
         { .uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = connectivity_check_get_handler },
     };
     for (size_t i = 0; i < sizeof(handlers) / sizeof(handlers[0]); i++) {
-        ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_http_server, &handlers[i]), TAG,
-                            "failed to register HTTP handler");
+        err = httpd_register_uri_handler(s_http_server, &handlers[i]);
+        if (err != ESP_OK) {
+            httpd_stop(s_http_server);
+            s_http_server = NULL;
+            service_health_set(SERVICE_HTTP, SERVICE_STATE_DEGRADED, err);
+            return err;
+        }
     }
-    ESP_RETURN_ON_ERROR(httpd_register_err_handler(s_http_server, HTTPD_404_NOT_FOUND,
-                                                    not_found_handler), TAG,
-                        "failed to register captive redirect");
+    err = httpd_register_err_handler(s_http_server, HTTPD_404_NOT_FOUND, not_found_handler);
+    if (err != ESP_OK) {
+        httpd_stop(s_http_server);
+        s_http_server = NULL;
+        service_health_set(SERVICE_HTTP, SERVICE_STATE_DEGRADED, err);
+        return err;
+    }
     s_http_ready = true;
+    service_health_set(SERVICE_HTTP, SERVICE_STATE_READY, ESP_OK);
     update_network_led();
     ESP_LOGI(TAG, "HTTP API started on port 80");
     return ESP_OK;
@@ -1064,19 +1165,43 @@ static esp_err_t start_http_server(void)
 esp_err_t network_init(void)
 {
     update_network_led();
+    if (s_manager_queue == NULL) {
+        s_manager_queue = xQueueCreateStatic(NETWORK_EVENT_QUEUE_LENGTH,
+                                              sizeof(manager_event_t),
+                                              s_manager_queue_storage,
+                                              &s_manager_queue_buffer);
+        ESP_RETURN_ON_FALSE(s_manager_queue != NULL, ESP_ERR_NO_MEM, TAG,
+                            "failed to create network manager queue");
+    }
     ESP_RETURN_ON_ERROR(init_nvs(), TAG, "failed to initialize NVS");
     ESP_RETURN_ON_ERROR(load_api_token(), TAG, "failed to load API token");
-    ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "failed to initialize TCP/IP stack");
-    ESP_RETURN_ON_ERROR(esp_event_loop_create_default(), TAG, "failed to create event loop");
+    if (!s_netif_initialized) {
+        ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "failed to initialize TCP/IP stack");
+        s_netif_initialized = true;
+    }
+    if (!s_event_loop_initialized) {
+        esp_err_t loop_err = esp_event_loop_create_default();
+        ESP_RETURN_ON_FALSE(loop_err == ESP_OK || loop_err == ESP_ERR_INVALID_STATE,
+                            loop_err, TAG, "failed to create event loop");
+        s_event_loop_initialized = true;
+    }
 
-    s_sta_netif = esp_netif_create_default_wifi_sta();
-    s_ap_netif = esp_netif_create_default_wifi_ap();
+    if (s_sta_netif == NULL) {
+        s_sta_netif = esp_netif_create_default_wifi_sta();
+    }
+    if (s_ap_netif == NULL) {
+        s_ap_netif = esp_netif_create_default_wifi_ap();
+    }
     ESP_RETURN_ON_FALSE(s_sta_netif != NULL && s_ap_netif != NULL, ESP_ERR_NO_MEM, TAG,
                         "failed to create Wi-Fi interfaces");
 
-    wifi_init_config_t init_config = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_RETURN_ON_ERROR(esp_wifi_init(&init_config), TAG, "failed to initialize Wi-Fi");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_FLASH), TAG, "failed to enable Wi-Fi persistence");
+    if (!s_wifi_initialized) {
+        wifi_init_config_t init_config = WIFI_INIT_CONFIG_DEFAULT();
+        ESP_RETURN_ON_ERROR(esp_wifi_init(&init_config), TAG, "failed to initialize Wi-Fi");
+        ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_FLASH), TAG,
+                            "failed to enable Wi-Fi persistence");
+        s_wifi_initialized = true;
+    }
 
     wifi_config_t stored_config = { 0 };
     esp_err_t err = esp_wifi_get_config(WIFI_IF_STA, &stored_config);
@@ -1085,12 +1210,18 @@ esp_err_t network_init(void)
     }
     s_has_wifi_credentials = stored_config.sta.ssid[0] != '\0';
 
-    ESP_RETURN_ON_ERROR(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                                   wifi_event_handler, NULL), TAG,
-                        "failed to register Wi-Fi events");
-    ESP_RETURN_ON_ERROR(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                                   wifi_event_handler, NULL), TAG,
-                        "failed to register IP events");
+    if (!s_wifi_handler_registered) {
+        ESP_RETURN_ON_ERROR(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                       wifi_event_handler, NULL), TAG,
+                            "failed to register Wi-Fi events");
+        s_wifi_handler_registered = true;
+    }
+    if (!s_ip_handler_registered) {
+        ESP_RETURN_ON_ERROR(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                       wifi_event_handler, NULL), TAG,
+                            "failed to register IP events");
+        s_ip_handler_registered = true;
+    }
 
     bool needs_provisioning = !s_has_wifi_credentials || s_api_token[0] == '\0';
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(needs_provisioning ? WIFI_MODE_APSTA : WIFI_MODE_STA),
@@ -1101,16 +1232,31 @@ esp_err_t network_init(void)
         s_provisioning_forced = false;
     }
 
-    ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "failed to start Wi-Fi");
-    s_wifi_started = true;
-    if (s_provisioning) {
-        configure_captive_portal_dhcp();
-        s_dns_server = dns_server_start("WIFI_AP_DEF");
-        ESP_RETURN_ON_FALSE(s_dns_server != NULL, ESP_ERR_NO_MEM, TAG,
-                            "failed to start captive DNS");
-        update_network_led();
+    if (!s_wifi_started) {
+        ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "failed to start Wi-Fi");
+        s_wifi_started = true;
     }
-    return start_http_server();
+    if (s_provisioning && s_dns_server == NULL) {
+        configure_captive_portal_dhcp();
+        if (s_dns_start_attempted) {
+            service_health_note_restart(SERVICE_DNS);
+        }
+        s_dns_start_attempted = true;
+        s_dns_server = dns_server_start("WIFI_AP_DEF");
+        if (s_dns_server == NULL) {
+            service_health_set(SERVICE_DNS, SERVICE_STATE_DEGRADED, ESP_ERR_NO_MEM);
+            return ESP_ERR_NO_MEM;
+        }
+        service_health_set(SERVICE_DNS, SERVICE_STATE_READY, ESP_OK);
+        update_network_led();
+    } else if (!s_provisioning) {
+        service_health_set(SERVICE_DNS, SERVICE_STATE_READY, ESP_OK);
+    }
+    esp_err_t http_err = s_http_ready ? ESP_OK : start_http_server();
+    service_health_set(SERVICE_NETWORK,
+                       http_err == ESP_OK ? SERVICE_STATE_READY : SERVICE_STATE_DEGRADED,
+                       http_err);
+    return http_err;
 }
 
 esp_err_t network_start_provisioning(void)
