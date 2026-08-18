@@ -1,123 +1,248 @@
 #include <stdio.h>
 #include <inttypes.h>
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "board.h"
 #include "driver/touch_sens.h"
+#include "esp_check.h"
 #include "esp_log.h"
+#include "touch_gesture.h"
 #include "touch_sens_config.h"
 
 /* --- key → channel mapping --- */
 #define NUM_KEYS 6
 #define INIT_SCAN_TIMES 3
+#define KEY_EVENT_QUEUE_LENGTH 16
 
+// board.h is the single source of truth for electrode-to-key mapping.
 static const int s_channel_id[NUM_KEYS] = {
-    3,  // key 1 = channel 1 = GPIO1
-    2,  // key 2 = channel 2 = GPIO2
-    1,  // key 3 = channel 3 = GPIO3
-    6,  // key 4 = channel 4 = GPIO4
-    4,  // key 5 = channel 5 = GPIO5
-    5   // key 6 = channel 6 = GPIO6
+    TOUCH_KEY1,
+    TOUCH_KEY2,
+    TOUCH_KEY3,
+    TOUCH_KEY4,
+    TOUCH_KEY5,
+    TOUCH_KEY6,
 };
 
 // Active threshold to benchmark ratio. (i.e., touch will be activated when data >= benchmark * (1 + ratio))
-static float s_thresh2bm_ratio[NUM_KEYS] = {
-    [0 ... NUM_KEYS - 1] = 0.0001f,  // 1.5%
+static const float s_thresh2bm_ratio[NUM_KEYS] = {
+    [0 ... NUM_KEYS - 1] = 0.020f,  // 2.0%
 };
 
-static uint8_t last_key = 0;
+typedef struct {
+    uint8_t key;
+    bool active;
+} touch_edge_t;
+
 static const char *TAG = "touch_keys";
+static touch_sensor_handle_t s_sensor_handle;
+static touch_channel_handle_t s_channel_handle[NUM_KEYS];
+static QueueHandle_t s_key_event_queue;
+static touch_gesture_t s_gesture;
+static volatile bool s_event_overflow;
 
-bool on_active(touch_sensor_handle_t sens_handle,
-                    const touch_active_event_data_t *event,
-                    void *user_ctx)
+static void cleanup_touch(void)
 {
-    // Map channel → key index
-    for (int i = 0; i < NUM_KEYS; i++) {
-        if (event->chan_id == s_channel_id[i]) {
-            last_key = i + 1;   // key numbers start at 1
-            break;
+    if (s_sensor_handle != NULL) {
+        (void)touch_sensor_stop_continuous_scanning(s_sensor_handle);
+        (void)touch_sensor_disable(s_sensor_handle);
+    }
+    if (s_key_event_queue != NULL) {
+        vQueueDelete(s_key_event_queue);
+        s_key_event_queue = NULL;
+    }
+    touch_gesture_init(&s_gesture);
+    __atomic_store_n(&s_event_overflow, false, __ATOMIC_RELAXED);
+    for (int i = NUM_KEYS - 1; i >= 0; --i) {
+        if (s_channel_handle[i] != NULL) {
+            (void)touch_sensor_del_channel(s_channel_handle[i]);
+            s_channel_handle[i] = NULL;
         }
-    }    return false;
+    }
+    if (s_sensor_handle != NULL) {
+        (void)touch_sensor_del_controller(s_sensor_handle);
+        s_sensor_handle = NULL;
+    }
 }
 
-bool on_inactive(touch_sensor_handle_t sens_handle,
-                    const touch_inactive_event_data_t *event,
-                    void *user_ctx)
+static uint8_t channel_to_key(int channel)
 {
-    return false;
+    for (int i = 0; i < NUM_KEYS; i++) {
+        if (channel == s_channel_id[i]) {
+            return i + 1;
+        }
+    }
+    return 0;
 }
 
-static void do_initial_scanning(touch_sensor_handle_t sens_handle, touch_channel_handle_t chan_handle[])
+static bool queue_edge(int channel, bool active)
+{
+    touch_edge_t edge = {
+        .key = channel_to_key(channel),
+        .active = active,
+    };
+
+    BaseType_t high_priority_task_woken = pdFALSE;
+    if (edge.key != 0 && s_key_event_queue != NULL &&
+        xQueueSendFromISR(s_key_event_queue, &edge, &high_priority_task_woken) != pdTRUE) {
+        __atomic_store_n(&s_event_overflow, true, __ATOMIC_RELEASE);
+    }
+    return high_priority_task_woken == pdTRUE;
+}
+
+static bool on_active(touch_sensor_handle_t sens_handle,
+                      const touch_active_event_data_t *event,
+                      void *user_ctx)
+{
+    (void)sens_handle;
+    (void)user_ctx;
+    return queue_edge(event->chan_id, true);
+}
+
+static bool on_inactive(touch_sensor_handle_t sens_handle,
+                        const touch_inactive_event_data_t *event,
+                        void *user_ctx)
+{
+    (void)sens_handle;
+    (void)user_ctx;
+    return queue_edge(event->chan_id, false);
+}
+
+static esp_err_t do_initial_scanning(touch_sensor_handle_t sens_handle,
+                                     touch_channel_handle_t chan_handle[])
 {
     /* Enable the touch sensor to do the initial scanning, so that to initialize the channel data */
-    ESP_ERROR_CHECK(touch_sensor_enable(sens_handle));
+    ESP_RETURN_ON_ERROR(touch_sensor_enable(sens_handle), TAG, "failed to enable initial scan");
 
     /* Scan the enabled touch channels for several times, to make sure the initial channel data is stable */
     for (int i = 0; i < INIT_SCAN_TIMES; i++) {
-        ESP_ERROR_CHECK(touch_sensor_trigger_oneshot_scanning(sens_handle, 5000));
+        ESP_RETURN_ON_ERROR(touch_sensor_trigger_oneshot_scanning(sens_handle, 5000), TAG,
+                            "initial scan %d failed", i);
     }
 
     /* Disable the touch channel to rollback the state */
-    ESP_ERROR_CHECK(touch_sensor_disable(sens_handle));
+    ESP_RETURN_ON_ERROR(touch_sensor_disable(sens_handle), TAG, "failed to disable after initial scan");
 
     /* Read the initial channel benchmark and reconfig the channel active threshold accordingly */
     printf("Initial benchmark and new threshold are:\n");
     for (int i = 0; i < NUM_KEYS; i++) {
         /* Read the initial benchmark of the touch channel */
         uint32_t benchmark[TOUCH_SAMPLE_CFG_NUM] = {};
-        ESP_ERROR_CHECK(touch_channel_read_data(chan_handle[i], TOUCH_CHAN_DATA_TYPE_BENCHMARK, benchmark));
+        ESP_RETURN_ON_ERROR(touch_channel_read_data(chan_handle[i], TOUCH_CHAN_DATA_TYPE_BENCHMARK, benchmark),
+                            TAG, "failed to read channel %d benchmark", (int)s_channel_id[i]);
         /* Calculate the proper active thresholds regarding the initial benchmark */
         printf("Touch [CH %d]", s_channel_id[i]);
         /* Generate the default channel configuration and then update the active threshold based on the real benchmark */
         touch_channel_config_t chan_cfg = TOUCH_CHAN_CFG_DEFAULT();
         for (int j = 0; j < TOUCH_SAMPLE_CFG_NUM; j++) {
             chan_cfg.active_thresh[j] = (uint32_t)(benchmark[j] * s_thresh2bm_ratio[i]);
+            printf(" %d: %" PRIu32 ", %" PRIu32 "\t",
+                   j, benchmark[j], chan_cfg.active_thresh[j]);
         }
+        printf("\n");
+        ESP_RETURN_ON_ERROR(touch_sensor_reconfig_channel(chan_handle[i], &chan_cfg), TAG,
+                            "failed to configure channel %d threshold", (int)s_channel_id[i]);
     }
+
+    return ESP_OK;
 }
 
-void touch_sens_init(void)
+esp_err_t touch_sens_init(void)
 {
-    /* Handles of touch sensor */
-    touch_sensor_handle_t sens_handle = NULL;
-    touch_channel_handle_t chan_handle[NUM_KEYS];
+    ESP_RETURN_ON_FALSE(s_sensor_handle == NULL, ESP_ERR_INVALID_STATE, TAG, "driver is already initialized");
 
     /* Step 1: Create a touch sensor controller handle */
     touch_sensor_sample_config_t sample_cfg[TOUCH_SAMPLE_CFG_NUM] = TOUCH_SAMPLE_CFG_DEFAULT();
     touch_sensor_config_t sens_cfg = TOUCH_SENSOR_DEFAULT_BASIC_CONFIG(TOUCH_SAMPLE_CFG_NUM, sample_cfg);
-    ESP_ERROR_CHECK(touch_sensor_new_controller(&sens_cfg, &sens_handle));
+    esp_err_t err = touch_sensor_new_controller(&sens_cfg, &s_sensor_handle);
+    if (err != ESP_OK) {
+        cleanup_touch();
+        return err;
+    }
 
     /* Step 2: Create and enable the new touch channel handles */
     touch_channel_config_t chan_cfg = TOUCH_CHAN_CFG_DEFAULT();
     /* Allocate new touch channel on the touch controller */
     for (int i = 0; i < NUM_KEYS; i++) {
-        ESP_ERROR_CHECK(touch_sensor_new_channel(sens_handle, s_channel_id[i], &chan_cfg, &chan_handle[i]));
+        err = touch_sensor_new_channel(s_sensor_handle, s_channel_id[i], &chan_cfg,
+                                       &s_channel_handle[i]);
+        if (err != ESP_OK) {
+            cleanup_touch();
+            return err;
+        }
     }
 
-    /* Step 3: Configure the default filter for the touch sensor */
+    /* Step 3: Configure noise rejection while preserving through-panel response. */
     touch_sensor_filter_config_t filter_cfg = TOUCH_SENSOR_DEFAULT_FILTER_CONFIG();
-    ESP_ERROR_CHECK(touch_sensor_config_filter(sens_handle, &filter_cfg));
+    filter_cfg.benchmark.filter_mode = TOUCH_BM_IIR_FILTER_16;
+    filter_cfg.benchmark.denoise_lvl = 2;
+    filter_cfg.data.smooth_filter = TOUCH_SMOOTH_IIR_FILTER_4;
+    filter_cfg.data.active_hysteresis = 3;
+    filter_cfg.data.debounce_cnt = 4;
+    err = touch_sensor_config_filter(s_sensor_handle, &filter_cfg);
+    if (err != ESP_OK) {
+        cleanup_touch();
+        return err;
+    }
 
     /* Step 4: Do the initial scanning to initialize the channel data */
-    do_initial_scanning(sens_handle, chan_handle);
+    err = do_initial_scanning(s_sensor_handle, s_channel_handle);
+    if (err != ESP_OK) {
+        cleanup_touch();
+        return err;
+    }
+
+    s_key_event_queue = xQueueCreate(KEY_EVENT_QUEUE_LENGTH, sizeof(touch_edge_t));
+    if (s_key_event_queue == NULL) {
+        cleanup_touch();
+        return ESP_ERR_NO_MEM;
+    }
 
     /* Step 5: Register the event callbacks for the touch sensor */
     touch_event_callbacks_t callbacks = {
         .on_active = on_active,
         .on_inactive = on_inactive,
     };
-    ESP_ERROR_CHECK(touch_sensor_register_callbacks(sens_handle, &callbacks, NULL));
+    err = touch_sensor_register_callbacks(s_sensor_handle, &callbacks, NULL);
+    if (err != ESP_OK) {
+        cleanup_touch();
+        return err;
+    }
 
     /* Step 6: Enable the touch sensor */
-    ESP_ERROR_CHECK(touch_sensor_enable(sens_handle));
+    err = touch_sensor_enable(s_sensor_handle);
+    if (err != ESP_OK) {
+        cleanup_touch();
+        return err;
+    }
 
     /* Step 7: Start continuous scanning */
-    ESP_ERROR_CHECK(touch_sensor_start_continuous_scanning(sens_handle));
+    err = touch_sensor_start_continuous_scanning(s_sensor_handle);
+    if (err != ESP_OK) {
+        cleanup_touch();
+        return err;
+    }
+    touch_gesture_init(&s_gesture);
+    __atomic_store_n(&s_event_overflow, false, __ATOMIC_RELEASE);
+    return ESP_OK;
 }
 
 uint8_t touch_sens_get_key_num(void)
 {
-    uint8_t key = last_key;
-    last_key = 0;   // reset after reading
-    return key;
+    if (s_key_event_queue == NULL) {
+        return 0;
+    }
+    uint32_t now_ms = (uint32_t)xTaskGetTickCount() * (uint32_t)portTICK_PERIOD_MS;
+    if (__atomic_exchange_n(&s_event_overflow, false, __ATOMIC_ACQ_REL)) {
+        touch_edge_t discarded;
+        while (xQueueReceive(s_key_event_queue, &discarded, 0) == pdTRUE) {
+        }
+        touch_gesture_discard_until_quiet(&s_gesture, now_ms);
+        return 0;
+    }
+    touch_edge_t edge;
+    while (xQueueReceive(s_key_event_queue, &edge, 0) == pdTRUE) {
+        touch_gesture_edge(&s_gesture, edge.key, edge.active, now_ms);
+    }
+    return touch_gesture_poll(&s_gesture, now_ms);
 }

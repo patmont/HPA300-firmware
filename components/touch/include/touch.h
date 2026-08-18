@@ -1,7 +1,8 @@
 #pragma once
 
 #include <stdint.h>
-#include <stdbool.h>
 
-void touch_sens_init(void);
+#include "esp_err.h"
+
+esp_err_t touch_sens_init(void);
 uint8_t touch_sens_get_key_num(void);

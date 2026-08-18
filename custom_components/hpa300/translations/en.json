@@ -1,0 +1,50 @@
+{
+  "title": "HPA300",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to an HPA300",
+        "description": "Enter the IP address or host name and the API token configured on the purifier.",
+        "data": { "host": "Host", "api_token": "API token" }
+      },
+      "reauth_confirm": {
+        "title": "Reconnect HPA300",
+        "description": "Enter the current host and API token.",
+        "data": { "host": "Host", "api_token": "API token" }
+      },
+      "reconfigure": {
+        "title": "Reconfigure HPA300",
+        "description": "Update the host or API token.",
+        "data": { "host": "Host", "api_token": "API token" }
+      }
+    },
+    "error": {
+      "cannot_connect": "Unable to connect to the HPA300",
+      "invalid_auth": "The API token was rejected",
+      "invalid_host": "Enter an IP address or host name, not an API URL"
+    },
+    "abort": {
+      "already_configured": "This HPA300 is already configured",
+      "reauth_successful": "Authentication updated",
+      "reconfigure_successful": "Configuration updated",
+      "unique_id_mismatch": "The host belongs to a different HPA300"
+    }
+  },
+  "entity": {
+    "sensor": {
+      "activity": { "name": "Last activity" },
+      "control_source": { "name": "Control source" },
+      "timer": { "name": "Shutoff timer" },
+      "control_state": { "name": "Control state" },
+      "last_boot": { "name": "Last boot" },
+      "uptime": { "name": "Uptime" },
+      "free_heap": { "name": "Free memory" },
+      "minimum_free_heap": { "name": "Minimum free memory" }
+    },
+    "binary_sensor": {
+      "fault": { "name": "Fan fault" },
+      "maintenance": { "name": "Maintenance" },
+      "wifi": { "name": "Wi-Fi" }
+    }
+  }
+}

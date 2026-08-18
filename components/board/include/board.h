@@ -1,39 +1,47 @@
 #pragma once
 #include "driver/gpio.h"
-#include "driver/touch_sens.h"
 
-// Touch Key Definitions (touch pad numbers)
-#define TOUCH_KEY1  TOUCH_PAD_NUM3
-#define TOUCH_KEY2  TOUCH_PAD_NUM2
-#define TOUCH_KEY3  TOUCH_PAD_NUM1
-#define TOUCH_KEY4  TOUCH_PAD_NUM5
-#define TOUCH_KEY5  TOUCH_PAD_NUM6
-#define TOUCH_KEY6  TOUCH_PAD_NUM4
+// Touch key definitions verified against the HPA300 KiCad schematic and PCB.
+// ESP32-S2 touch channels 1-14 map directly to GPIOs 1-14.
+#define TOUCH_KEY1  3
+#define TOUCH_KEY2  2
+#define TOUCH_KEY3  1
+#define TOUCH_KEY4  5
+#define TOUCH_KEY5  6
+#define TOUCH_KEY6  4
 
 // LED GPIOs (simple GPIO numbers)
-#define LED1_GPIO  GPIO_NUM_12
-#define LED2_GPIO  GPIO_NUM_15
-#define LED3_GPIO  GPIO_NUM_8
-#define LED4_GPIO  GPIO_NUM_13
-#define LED5_GPIO  GPIO_NUM_7
-#define LED6_GPIO  GPIO_NUM_9
-#define LED7_GPIO  GPIO_NUM_14
-#define LED8_GPIO  GPIO_NUM_11
-#define LED9_GPIO  GPIO_NUM_10
+#define BOARD_LED_GPIOS(IDENT) \
+    IDENT(LED_1,  GPIO_NUM_12) \
+    IDENT(LED_2,  GPIO_NUM_15) \
+    IDENT(LED_3,  GPIO_NUM_8)  \
+    IDENT(LED_4,  GPIO_NUM_13) \
+    IDENT(LED_5,  GPIO_NUM_7)  \
+    IDENT(LED_6,  GPIO_NUM_9)  \
+    IDENT(LED_7,  GPIO_NUM_14) \
+    IDENT(LED_8,  GPIO_NUM_11) \
+    IDENT(LED_9,  GPIO_NUM_10)
 
+// LED Indicators
+#define BOARD_FAN_LED(IDENT) \
+    IDENT(FAN_LED_1,  LED_7) \
+    IDENT(FAN_LED_2,  LED_4) \
+    IDENT(FAN_LED_3,  LED_1) \
+    IDENT(FAN_LED_4,  LED_8)
+
+// Generate enum entries for each LED
+#define LED_ENUM_ENTRY(name, gpio) name,
 typedef enum {
     LED_OFF = -1,
-    LED_1 = 0,
-    LED_2,
-    LED_3,
-    LED_4,
-    LED_5,
-    LED_6,
-    LED_7,
-    LED_8,
-    LED_9,
-    LED_COUNT
+    BOARD_LED_GPIOS(LED_ENUM_ENTRY)
+    NUM_LEDS
 } led_index_t;
+#undef LED_ENUM_ENTRY
+
+extern const gpio_num_t led_gpios[NUM_LEDS];
+
+#define BOARD_FAN_SPEED_COUNT 5
+extern const led_index_t fan_led_map[BOARD_FAN_SPEED_COUNT];
 
 // HC238 Fan Selector GPIOs
 // If a select line is hardwired, set to 0 or 1.

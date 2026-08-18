@@ -1,4 +1,5 @@
 idf_component_register(
-    REQUIRES esp_driver_touch_sens
+    SRCS "board.c"
+    REQUIRES esp_driver_gpio
     INCLUDE_DIRS "include"
 )
