@@ -104,20 +104,38 @@ The version 1 HTTP API listens on port 80:
 Operational API requests require `Authorization: Bearer <token>`; the only
 exception is signed OTA recovery through the AP during a physical maintenance
 window. The token is protected from unauthenticated API clients, but HTTP does
-not encrypt it on the LAN. Use this phase on a trusted network. A REST fan package example is in
-`home-assistant/hpa300.yaml.example`; it polls actual controller state every
-five seconds and exposes a standard Home Assistant fan with four 25% steps.
-Copy it into a Home Assistant packages directory, add the documented URLs and
-authorization value to `secrets.yaml`, and reserve the purifier's DHCP address.
+not encrypt it on the LAN. Use this phase on a trusted network.
 
-The package also defines a read-only `sensor.hpa300_diagnostics` heartbeat. It
-polls `/api/v1/device` every 30 seconds and records every response, including
-the firmware version, `last_boot` reset details, and runtime uptime/free-heap
-watermarks, actor timing/counters, latest fault, and boot-scoped flash activity,
-so overnight availability and reboot causes can be reviewed in
-Home Assistant History. Remove
-`force_update: true` after active troubleshooting if the per-poll history is no
-longer useful.
+### Home Assistant
+
+The recommended Home Assistant setup is the HACS-compatible custom integration
+in `custom_components/hpa300`. It creates a first-class HPA300 device with a
+four-speed fan, activity and timer sensors,
+fault/maintenance/connectivity binary sensors, firmware metadata, diagnostic
+sensors, History support, and a redacted diagnostics download. Fan state is
+polled every five seconds and the larger device diagnostics response every 30
+seconds.
+
+Fan control uses Home Assistant's native evenly spaced levels: 25%, 50%, 75%,
+and 100%. The bundled light/dark brand assets are derived from the project logo
+and are shown locally by Home Assistant 2026.3 and newer.
+
+Install it with HACS:
+
+1. In HACS, open the three-dot menu, select **Custom repositories**, and add
+   `https://github.com/patmont/HPA300-firmware` with category **Integration**.
+2. Find and download **HPA300**, then restart Home Assistant.
+3. Go to **Settings > Devices & services > Add integration**, select
+   **HPA300**, and enter the purifier's IP address/host name and API token.
+
+Home Assistant automatically creates the device page and entity history. For a
+dedicated Lovelace card, copy `home-assistant/dashboard.yaml.example` into a
+manual dashboard card and adjust entity IDs if they were renamed. Reserve the
+purifier's DHCP address, or reconfigure the integration if its address changes.
+
+The older YAML REST package remains in `home-assistant/hpa300.yaml.example` for
+installations that do not use HACS. Do not load both approaches for the same
+purifier or duplicate fan and sensor entities will be created.
 
 Crash dumps use the compact binary format and are stored in the dedicated
 64 KiB coredump partition. The first crash is retained across a later reset
