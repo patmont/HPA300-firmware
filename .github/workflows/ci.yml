@@ -17,22 +17,24 @@ jobs:
   firmware:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Build and verify in the project devcontainer
         uses: devcontainers/ci@v0.3
         with:
           push: never
           runCmd: |
-            python tools/project.py prepare
-            idf.py build
-            idf.py -C test -B build-test build
-            espsecure.py verify_signature --version 2 --keyfile secrets/hpa300-ota-signing-key.pem build/HPA300-FIRMWARE.bin
+            /opt/esp/entrypoint.sh bash -lc '
+              python tools/project.py prepare
+              idf.py build
+              idf.py -C test -B build-test build
+              espsecure.py verify_signature --version 2 --keyfile secrets/hpa300-ota-signing-key.pem build/HPA300-FIRMWARE.bin
+            '
 
   repository:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
       - name: Validate Python syntax

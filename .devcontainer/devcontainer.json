@@ -30,5 +30,5 @@
       ]
     }
   },
-  "postCreateCommand": "idf.py --version"
+  "postCreateCommand": "/opt/esp/entrypoint.sh idf.py --version"
 }
