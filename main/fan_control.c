@@ -22,10 +22,9 @@
 #define EVENT_INITIALIZED BIT0
 #define EVENT_QUIESCED BIT1
 
-// Temporary hardware-test durations retained from the existing controller.
-#define FAN_SHUTOFF_2H_DURATION_MS 2000
-#define FAN_SHUTOFF_4H_DURATION_MS 4000
-#define FAN_SHUTOFF_8H_DURATION_MS 8000
+#define FAN_SHUTOFF_2H_DURATION_MS (2U * 60U * 60U * 1000U)
+#define FAN_SHUTOFF_4H_DURATION_MS (4U * 60U * 60U * 1000U)
+#define FAN_SHUTOFF_8H_DURATION_MS (8U * 60U * 60U * 1000U)
 
 typedef struct {
     fan_control_action_t action;

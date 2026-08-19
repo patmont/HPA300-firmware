@@ -1,5 +1,3 @@
-#include <stdio.h>
-#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "board.h"
@@ -124,22 +122,20 @@ static esp_err_t do_initial_scanning(touch_sensor_handle_t sens_handle,
     ESP_RETURN_ON_ERROR(touch_sensor_disable(sens_handle), TAG, "failed to disable after initial scan");
 
     /* Read the initial channel benchmark and reconfig the channel active threshold accordingly */
-    printf("Initial benchmark and new threshold are:\n");
     for (int i = 0; i < NUM_KEYS; i++) {
         /* Read the initial benchmark of the touch channel */
         uint32_t benchmark[TOUCH_SAMPLE_CFG_NUM] = {};
         ESP_RETURN_ON_ERROR(touch_channel_read_data(chan_handle[i], TOUCH_CHAN_DATA_TYPE_BENCHMARK, benchmark),
                             TAG, "failed to read channel %d benchmark", (int)s_channel_id[i]);
         /* Calculate the proper active thresholds regarding the initial benchmark */
-        printf("Touch [CH %d]", s_channel_id[i]);
         /* Generate the default channel configuration and then update the active threshold based on the real benchmark */
         touch_channel_config_t chan_cfg = TOUCH_CHAN_CFG_DEFAULT();
         for (int j = 0; j < TOUCH_SAMPLE_CFG_NUM; j++) {
             chan_cfg.active_thresh[j] = (uint32_t)(benchmark[j] * s_thresh2bm_ratio[i]);
-            printf(" %d: %" PRIu32 ", %" PRIu32 "\t",
-                   j, benchmark[j], chan_cfg.active_thresh[j]);
+            ESP_LOGD(TAG, "channel=%d sample=%d benchmark=%lu threshold=%lu",
+                     s_channel_id[i], j, (unsigned long)benchmark[j],
+                     (unsigned long)chan_cfg.active_thresh[j]);
         }
-        printf("\n");
         ESP_RETURN_ON_ERROR(touch_sensor_reconfig_channel(chan_handle[i], &chan_cfg), TAG,
                             "failed to configure channel %d threshold", (int)s_channel_id[i]);
     }

@@ -1,26 +1,34 @@
 {
-	"name": "ESP-IDF QEMU",
-	"build": {
-		"dockerfile": "Dockerfile"
-	},
-	"customizations": {
-		"vscode": {
-			"settings": {
-				"terminal.integrated.defaultProfile.linux": "bash",
-				"idf.espIdfPath": "/opt/esp/idf",
-				"idf.toolsPath": "/opt/esp",
-				"idf.gitPath": "/usr/bin/git"
-			},
-			"extensions": [
-				"espressif.esp-idf-extension",
-				"espressif.esp-idf-web"
-			]
-		}
-	},
-	"runArgs": [
-		"--privileged"
-	],
-	"features": {
-		"ghcr.io/devcontainers-extra/features/cmake:1": {}
-	}
+  "name": "HPA300 ESP-IDF 5.5.1",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "args": {
+      "DOCKER_TAG": "v5.5.1"
+    }
+  },
+  "remoteUser": "ubuntu",
+  "containerEnv": {
+    "IDF_TARGET": "esp32s2",
+    "IDF_PATH": "/opt/esp/idf",
+    "IDF_TOOLS_PATH": "/opt/esp",
+    "IDF_PYTHON_ENV_PATH": "/opt/esp/python_env/idf5.5_py3.12_env",
+    "IDF_GIT_SAFE_DIR": "${containerWorkspaceFolder}"
+  },
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "idf.customExtraVars": {
+          "IDF_PATH": "/opt/esp/idf",
+          "IDF_TOOLS_PATH": "/opt/esp",
+          "IDF_PYTHON_ENV_PATH": "/opt/esp/python_env/idf5.5_py3.12_env"
+        }
+      },
+      "extensions": [
+        "espressif.esp-idf-extension",
+        "ms-vscode.cpptools"
+      ]
+    }
+  },
+  "postCreateCommand": "/opt/esp/entrypoint.sh idf.py --version"
 }

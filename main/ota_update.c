@@ -192,11 +192,6 @@ void ota_update_abort(void)
     s_busy = false;
 }
 
-bool ota_update_is_busy(void)
-{
-    return s_busy;
-}
-
 esp_err_t ota_update_get_info(ota_update_info_t *info)
 {
     ESP_RETURN_ON_FALSE(info != NULL, ESP_ERR_INVALID_ARG, TAG, "info is NULL");

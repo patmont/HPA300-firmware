@@ -3,3 +3,9 @@ build-test/
 sdkconfig
 sdkconfig.old
 secrets/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.DS_Store
+Thumbs.db

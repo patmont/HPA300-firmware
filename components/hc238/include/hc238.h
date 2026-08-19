@@ -31,7 +31,6 @@ esp_err_t hc238_init(const hc238_config_t *cfg);
 // the decoder first; this split lets safety-critical callers prove that every
 // transition has exactly one disable/address/enable sequence.
 esp_err_t hc238_set_address(uint8_t index);
-esp_err_t hc238_set_output(uint8_t index);
 esp_err_t hc238_enable(bool en);
 
 #endif // HC238_H

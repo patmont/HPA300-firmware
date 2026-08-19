@@ -10,7 +10,8 @@ exclusive fan selection through a 74HC238 decoder.
 - ESP32-S2 target
 
 The target is recorded in `sdkconfig.defaults`, and the development container is
-pinned to ESP-IDF v5.5.1. A normal command-line build is:
+pinned to ESP-IDF v5.5.1. See [BUILDING.md](BUILDING.md) for clean-machine setup
+on Windows, Linux, and macOS. A normal command-line build is:
 
 ```text
 idf.py set-target esp32s2
@@ -25,6 +26,9 @@ the key once from an ESP-IDF terminal and keep encrypted off-machine backups:
 ```text
 espsecure.py generate_signing_key --version 2 --scheme rsa3072 secrets/hpa300-ota-signing-key.pem
 ```
+
+See [docs/signing.md](docs/signing.md) for the official release-key policy and
+instructions for user-custom signing keys.
 
 An ordinary build produces `build/HPA300-FIRMWARE-unsigned.bin` and the signed
 `build/HPA300-FIRMWARE.bin`. Only the signed file may be flashed or uploaded.
@@ -138,8 +142,9 @@ installations that do not use HACS. Do not load both approaches for the same
 purifier or duplicate fan and sensor entities will be created.
 
 Crash dumps use the compact binary format and are stored in the dedicated
-64 KiB coredump partition. The first crash is retained across a later reset
-cascade. Keep the matching `build/HPA300-FIRMWARE.elf`; with the affected unit
+192 KiB coredump partition in the default 4 MB layout. The first crash is
+retained across a later reset cascade. Keep the matching
+`build/HPA300-FIRMWARE.elf`; with the affected unit
 in ROM download mode, inspect the retained dump before reflashing:
 
 ```text
@@ -205,10 +210,9 @@ release Boot, and confirm the physical flash size:
 esptool.py --chip esp32s2 -p COMx flash_id
 ```
 
-This controller reports 4 MB, so the project defaults to `partitions-4mb.csv`
-with two 1.875 MiB OTA slots. `partitions.csv` remains available for a verified
-2 MB board, but must never be replaced by the 4 MB layout unless `flash_id`
-reports sufficient capacity. Then perform the one-time migration:
+This controller reports 4 MB, matching the minimum supported ESP32-S2/S3 flash
+capacity for this project. The `partitions-4mb.csv` layout provides two
+1.875 MiB OTA slots. Then perform the one-time migration:
 
 ```text
 idf.py fullclean build
@@ -269,7 +273,7 @@ Current controls:
 | 1 | Cycles `off → fan 1 → fan 2 → fan 3 → off`. From fan 4, selects off. |
 | 2 | Toggles fan 4 and off. From any other active speed, selects fan 4. |
 | 3 | Directly cycles unified LED brightness: High (100%), Medium (50%), Low (5%), Off (0%). |
-| 6 | While a fan is active, cycles the automatic shutoff: 2 h (LED9), 4 h (LED6), 8 h (LED3), then Always-on (no timer LED). Selecting a timed mode starts its countdown. The current test build uses 2, 4, and 8 seconds respectively. |
+| 6 | While a fan is active, cycles the automatic shutoff: 2 h (LED9), 4 h (LED6), 8 h (LED3), then Always-on (no timer LED). Selecting a timed mode starts its countdown. |
 | 1, 2, 4, or 5 | If the intended brightness is below High, temporarily sets LEDs to High for three seconds after the last non-dimmer touch, then restores the intended brightness. |
 
 Crossing the fan Off position in either direction resets the intended LED brightness to High. For example, after an extended idle period at Off, key 1 selects fan 1 and leaves the LEDs at High.
