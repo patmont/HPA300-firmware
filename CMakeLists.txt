@@ -44,17 +44,11 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(HPA300-FIRMWARE)
 
 # Reject signed release images that would leave less than 64 KiB for future
-# growth. The alternate 4 MB layout is selected only after flash_id confirms
-# that the physical chip supports it.
-if(CONFIG_PARTITION_TABLE_FILENAME STREQUAL "partitions-4mb.csv")
-    set(HPA300_OTA_PARTITION_SIZE 1966080)
-else()
-    set(HPA300_OTA_PARTITION_SIZE 983040)
-endif()
+# growth in either 1.875 MiB OTA slot in the supported 4 MB layout.
 add_custom_command(TARGET app POST_BUILD
     COMMAND ${CMAKE_COMMAND}
         -DIMAGE=${CMAKE_BINARY_DIR}/${PROJECT_NAME}.bin
-        -DPARTITION_SIZE=${HPA300_OTA_PARTITION_SIZE}
+        -DPARTITION_SIZE=1966080
         -DMIN_HEADROOM=65536
         -P ${CMAKE_SOURCE_DIR}/cmake/check_ota_headroom.cmake
     VERBATIM

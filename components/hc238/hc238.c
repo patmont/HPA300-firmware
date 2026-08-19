@@ -174,9 +174,3 @@ esp_err_t hc238_set_address(uint8_t index)
 
     return ESP_OK;
 }
-
-esp_err_t hc238_set_output(uint8_t index)
-{
-    ESP_RETURN_ON_ERROR(hc238_enable(false), TAG, "failed to disable outputs");
-    return hc238_set_address(index);
-}

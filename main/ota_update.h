@@ -22,7 +22,6 @@ esp_err_t ota_update_begin(const uint8_t *image_header, size_t header_length,
 esp_err_t ota_update_write(const void *data, size_t length);
 esp_err_t ota_update_finish(void);
 void ota_update_abort(void);
-bool ota_update_is_busy(void);
 
 esp_err_t ota_update_get_info(ota_update_info_t *info);
 esp_err_t ota_update_select_previous(void);
@@ -30,4 +29,3 @@ esp_err_t ota_update_select_previous(void);
 bool ota_update_boot_is_pending(void);
 esp_err_t ota_update_confirm_running(void);
 esp_err_t ota_update_rollback_running(void);
-

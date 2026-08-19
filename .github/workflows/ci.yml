@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and verify in the project devcontainer
+        uses: devcontainers/ci@v0.3
+        with:
+          push: never
+          runCmd: |
+            python tools/project.py prepare
+            idf.py build
+            idf.py -C test -B build-test build
+            espsecure.py verify_signature --version 2 --keyfile secrets/hpa300-ota-signing-key.pem build/HPA300-FIRMWARE.bin
+
+  repository:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Validate Python syntax
+        run: python -m compileall -q custom_components tools
+      - name: Validate JSON
+        run: |
+          python -m json.tool hacs.json > /dev/null
+          python -m json.tool custom_components/hpa300/manifest.json > /dev/null
+          python -m json.tool custom_components/hpa300/strings.json > /dev/null
+          python -m json.tool custom_components/hpa300/translations/en.json > /dev/null
+      - name: Reject whitespace errors
+        run: git diff --check
+
+  hacs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: HACS validation
+        uses: hacs/action@main
+        with:
+          category: integration

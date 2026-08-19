@@ -157,18 +157,18 @@ to induce the watchdog/panic.
    ```
 
 4. Verify the dump is complete, decodes against the matching ELF, contains the
-   fan-control task and diagnostic snapshot, and fits the 64 KiB partition.
+   fan-control task and diagnostic snapshot, and fits the 192 KiB partition.
    If it is truncated or absent, stop: expand the coredump partition before an
    overnight run.
 5. Save the decoded output, then induce a second panic. Verify the original
    first dump was not overwritten.
 6. A retained test dump would prevent an overnight failure from being stored.
    After saving the evidence, verify `partitions-4mb.csv` still places only the
-   coredump partition at `0x3d0000` with size `0x10000`, then erase exactly that
+   coredump partition at `0x3d0000` with size `0x30000`, then erase exactly that
    partition while the board is out of the fan:
 
    ```powershell
-   esptool.py --chip esp32s2 -p COMx erase_region 0x3d0000 0x10000
+   esptool.py --chip esp32s2 -p COMx erase_region 0x3d0000 0x30000
    ```
 
 7. Reboot and confirm `coredump-info` reports no retained dump. Never erase a
@@ -195,10 +195,6 @@ to induce the watchdog/panic.
 7. Let one window expire. Expect `maintenance_active:false`, no temporary AP,
    and `403` on another upload.
 
-Prior observation retained for retest: fan control was possible while only the
-maintenance window was open. This is now documented as expected behavior; it
-is a failure only if control is accepted after the flash operation starts.
-
 ## 8. Signed LAN update -- required
 
 1. Record the current slot and turn the fan on.
@@ -214,9 +210,6 @@ is a failure only if control is accepted after the flash operation starts.
    closed, Wi-Fi/token survived, and all controls work.
 6. Verify the 30-second probation metadata write also occurred while the fan
    was quiesced, then normal fan commands became available again.
-
-Prior recorded build/slot observation: `168c0e9-dirty` booted from `ota_0`.
-Retain this only as historical evidence; record the current image independently.
 
 ## 9. Invalid image handling -- required
 
