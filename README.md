@@ -27,6 +27,9 @@ the key once from an ESP-IDF terminal and keep encrypted off-machine backups:
 espsecure.py generate_signing_key --version 2 --scheme rsa3072 secrets/hpa300-ota-signing-key.pem
 ```
 
+See [docs/signing.md](docs/signing.md) for the official release-key policy and
+instructions for user-custom signing keys.
+
 An ordinary build produces `build/HPA300-FIRMWARE-unsigned.bin` and the signed
 `build/HPA300-FIRMWARE.bin`. Only the signed file may be flashed or uploaded.
 The build fails if the signed image leaves less than 64 KiB in an OTA slot. A

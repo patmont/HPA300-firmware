@@ -87,8 +87,9 @@ the signed-image build works; CI-produced firmware is not an official release.
 
 ## Release builds
 
-Release images must come from a clean, exact `v*` tag and use the intended
-offline release key. Verify the resulting binary before flashing or publishing:
+Release images must come from a clean, exact `v*` tag and use the central
+offline release key described in [docs/signing.md](docs/signing.md). Verify the
+resulting binary before flashing or publishing:
 
 ```text
 espsecure.py verify_signature --version 2 --keyfile secrets/hpa300-ota-signing-key.pem build/HPA300-FIRMWARE.bin
